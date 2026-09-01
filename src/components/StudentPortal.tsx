@@ -838,9 +838,9 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
 
   // Active Student View
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+    <div className="w-full max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-6 space-y-4 sm:space-y-6 overflow-hidden min-w-0">
       {/* Student Welcome Header & Phone Binding Card */}
-      <div className="bg-white dark:bg-slate-900 rounded-2xl p-5 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 sm:p-5 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4 w-full min-w-0 break-words">
         <div className="flex items-center gap-4">
           <div className="w-14 h-14 bg-gradient-to-br from-red-600 to-rose-800 text-white rounded-2xl flex items-center justify-center font-bold text-xl shadow-md">
             {activeStudent.nombre.substring(0, 2).toUpperCase()}
