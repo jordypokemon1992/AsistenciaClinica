@@ -440,19 +440,10 @@ export async function initDatabase(): Promise<Database> {
 
   console.log('✅ SQLite Local Database initialized and indexed successfully.');
 
-  // Asynchronously trigger Cloud SQL sync in background
-  syncToPostgreSql().catch((err) => {
-    console.warn('⚠️ Cloud SQL background synchronization note:', err);
-  });
-
-  // Asynchronously trigger Firestore sync in background if configured
-  if (isFirestoreConfigured()) {
-    syncAllToFirestore().then((res) => {
-      if (res.success) {
-        console.log('⚡ Firebase Firestore auto-sync completed:', res.message);
-      }
-    }).catch((err) => {
-      console.warn('⚠️ Firebase Firestore background sync note:', err);
+  // Asynchronously trigger Cloud SQL sync in background if configured
+  if (isCloudSqlConfigured()) {
+    syncToPostgreSql().catch((err) => {
+      console.warn('⚠️ Cloud SQL background synchronization note:', err);
     });
   }
 
@@ -1481,11 +1472,6 @@ export function unlinkAllDevicesInDb(): number {
     console.error('Error unlinking all devices:', err);
   }
   persistDatabase();
-
-  if (isFirestoreConfigured()) {
-    syncAllToFirestore().catch(() => {});
-  }
-
   return count;
 }
 
