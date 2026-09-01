@@ -82,7 +82,7 @@ class RootErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundar
 }
 
 // Register Service Worker for PWA Android/iOS support
-if ('serviceWorker' in navigator && process.env.NODE_ENV !== 'test') {
+if ('serviceWorker' in navigator && import.meta.env.MODE !== 'test') {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('/sw.js')

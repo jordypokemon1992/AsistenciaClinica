@@ -1,6 +1,5 @@
-const CACHE_NAME = 'clinicas-track-cache-v4';
+const CACHE_NAME = 'clinicas-track-cache-v5';
 const STATIC_ASSETS = [
-  '/',
   '/manifest.json',
   '/favicon.png',
   '/icon-192.png',
@@ -25,6 +24,7 @@ self.addEventListener('activate', (event) => {
       return Promise.all(
         keys.map((key) => {
           if (key !== CACHE_NAME) {
+            console.log('🧹 Purging obsolete Service Worker cache:', key);
             return caches.delete(key);
           }
         })
@@ -34,17 +34,23 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
 // Network-First for HTML navigation and API requests, with resilient asset fallback
 self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
 
   // 1. Completely bypass caching for all API endpoints, SSE streams, and non-GET requests
-  if (request.method !== 'GET' || url.pathname.startsWith('/api/')) {
+  if (request.method !== 'GET' || url.pathname.startsWith('/api/') || url.pathname.endsWith('sw.js')) {
     return;
   }
 
-  // 2. Navigation requests (HTML document): Network-first to always get fresh index.html, fallback to cache
+  // 2. Navigation requests (HTML document): Always network-first so new revisions are loaded immediately
   if (request.mode === 'navigate') {
     event.respondWith(
       fetch(request)
@@ -56,15 +62,13 @@ self.addEventListener('fetch', (event) => {
           return response;
         })
         .catch(() => {
-          return caches.match(request).then((cached) => {
-            return cached || caches.match('/index.html');
-          });
+          return caches.match(request);
         })
     );
     return;
   }
 
-  // 3. Static assets: Network-first with Cache fallback to guarantee latest deployed build JS/CSS
+  // 3. Static assets: Network-first with Cache fallback
   event.respondWith(
     fetch(request)
       .then((networkResponse) => {
