@@ -222,6 +222,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   }, [fetchFirebaseStatus, fetchFirebaseDiagnostics, activeTab]);
 
   const handleSyncToFirebase = async () => {
+    const confirmed = window.confirm(
+      '⚠️ ¿Deseas ejecutar un Respaldo Total a Google Firestore?\n\nNota: La aplicación ya cuenta con "Write-Through" automático en vivo (cada checada o edición individual se guarda sola en Firestore sin coste excesivo).\n\nUsa esta sincronización completa solo si deseas respaldar o sobrescribir masivamente todas las colecciones.'
+    );
+    if (!confirmed) return;
+
     setIsSyncingFirebase(true);
     setFirebaseSyncResult(null);
     try {
@@ -245,6 +250,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   };
 
   const handlePullFromFirebase = async (forceFull = false) => {
+    const confirmed = window.confirm(
+      '⚠️ ¿Deseas descargar y sobrescribir los datos locales desde Firestore?\n\nEsta acción leerá todas las colecciones desde Firestore y actualizará la base de datos local SQLite clinicas.db.\n\n¿Continuar con la restauración?'
+    );
+    if (!confirmed) return;
+
     setIsSyncingFirebase(true);
     setFirebaseSyncResult(null);
     try {
@@ -3471,7 +3481,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                       )}
                     </div>
                     <p className="text-xs text-slate-300 mt-0.5">
-                      Integración nativa sin servidores dedicados. Los datos se persisten en Google Firestore mientras que <code className="font-mono text-blue-300">clinicas.db</code> local brinda respuestas ultra rápidas a 0 ms.
+                      Arquitectura <strong>Write-Through Granular</strong> activa: cada checada o edición escribe únicamente su documento individual en Firestore. Todas las lecturas y consultas de la app se resuelven instantáneamente desde SQLite a 0 lecturas remotas.
                     </p>
                   </div>
                 </div>

@@ -38,6 +38,15 @@ import {
   pullFromFirestoreToCache,
   getFirestoreDiagnostics,
   getFirestoreStatusInfo,
+  syncStudentToFirestore,
+  deleteStudentFromFirestore,
+  syncRecordToFirestore,
+  deleteRecordFromFirestore,
+  syncSiteToFirestore,
+  deleteSiteFromFirestore,
+  syncHolidayToFirestore,
+  deleteHolidayFromFirestore,
+  syncConfigToFirestore,
 } from './src/server/firestore';
 
 const app = express();
@@ -235,11 +244,6 @@ app.post('/api/upload-state', (req, res) => {
       holidaysCount: snapshot.holidays.length,
       state: snapshot,
     });
-
-    // Write-through to Firestore Master asynchronously
-    if (isFirestoreConfigured()) {
-      syncAllToFirestore().catch((err) => console.warn('Firestore backup replication notice:', err));
-    }
   } catch (err: any) {
     res.status(500).json({ success: false, message: `Error importando a SQLite: ${err.message}` });
   }
@@ -299,11 +303,15 @@ app.post('/api/students', (req, res) => {
     saveMultipleStudentsToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
+    body.forEach((st) => {
+      syncStudentToFirestore(st).catch((err) => console.warn('Student granular sync notice:', err));
+    });
     return res.json({ success: true, students: updatedList });
   } else if (body && typeof body === 'object') {
     const saved = saveStudentToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
+    syncStudentToFirestore(saved).catch((err) => console.warn('Student granular sync notice:', err));
     return res.json({ success: true, student: saved, students: updatedList });
   }
   res.status(400).json({ success: false, message: 'Invalid payload' });
@@ -315,6 +323,7 @@ app.put('/api/students/:id', (req, res) => {
   const saved = saveStudentToDb({ ...body, id });
   if (saved) {
     broadcastChange('STUDENT_UPDATED', saved);
+    syncStudentToFirestore(saved).catch((err) => console.warn('Student update granular sync notice:', err));
     res.json({ success: true, student: saved });
   } else {
     res.status(404).json({ success: false, message: 'Student not found' });
@@ -326,6 +335,7 @@ app.delete('/api/students/:id', (req, res) => {
   const deleted = deleteStudentFromDb(id);
   if (deleted) {
     broadcastChange('STUDENT_DELETED', { id });
+    deleteStudentFromFirestore(id).catch((err) => console.warn('Student delete granular sync notice:', err));
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, message: 'Student not found' });
@@ -342,6 +352,7 @@ app.post('/api/students/link-device', (req, res) => {
   const updated = linkStudentDeviceInDb(studentId, matricula, deviceId, deviceName);
   if (updated) {
     broadcastChange('DEVICE_LINKED', updated);
+    syncStudentToFirestore(updated).catch((err) => console.warn('Device link granular sync notice:', err));
     return res.json({ success: true, student: updated });
   }
   res.status(404).json({ success: false, message: 'Student not found for device link' });
@@ -352,6 +363,10 @@ app.post('/api/students/unlink-device', (req, res) => {
   const unlinked = unlinkStudentDeviceInDb(studentId, matricula);
   if (unlinked) {
     broadcastChange('DEVICE_UNLINKED', { studentId, matricula });
+    const student = getStudentByMatriculaOrIdFromDb(studentId || matricula);
+    if (student) {
+      syncStudentToFirestore(student).catch((err) => console.warn('Device unlink granular sync notice:', err));
+    }
     return res.json({ success: true });
   }
   res.status(404).json({ success: false, message: 'Student not found' });
@@ -361,6 +376,9 @@ app.post('/api/students/unlink-all-devices', (_req, res) => {
   const count = unlinkAllDevicesInDb();
   const students = getStudentsFromDb();
   broadcastChange('STUDENTS_UPDATED', students);
+  students.forEach((st) => {
+    syncStudentToFirestore(st).catch((err) => console.warn('Unlink all granular sync notice:', err));
+  });
   res.json({ success: true, unlinkedCount: count, totalStudents: students.length });
 });
 
@@ -478,7 +496,10 @@ app.post('/api/records', (req, res) => {
 
   if (Array.isArray(body)) {
     body.forEach((rec) => {
-      if (rec && rec.id) saveRecordToDb(rec);
+      if (rec && rec.id) {
+        saveRecordToDb(rec);
+        syncRecordToFirestore(rec).catch((err) => console.warn('Record granular sync notice:', err));
+      }
     });
     const all = getRecordsFromDb();
     broadcastChange('RECORDS_UPDATED', all);
@@ -491,6 +512,7 @@ app.post('/api/records', (req, res) => {
 
   const saved = saveRecordToDb(body);
   broadcastChange('RECORD_SAVED', saved);
+  syncRecordToFirestore(saved).catch((err) => console.warn('Record granular sync notice:', err));
   res.json({ success: true, record: saved });
 });
 
@@ -499,6 +521,7 @@ app.delete('/api/records/:id', (req, res) => {
   const deleted = deleteRecordFromDb(id);
   if (deleted) {
     broadcastChange('RECORD_DELETED', { id });
+    deleteRecordFromFirestore(id).catch((err) => console.warn('Record delete granular sync notice:', err));
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, message: 'Record not found' });
@@ -513,7 +536,10 @@ app.get('/api/sites', (_req, res) => {
 app.post('/api/sites', (req, res) => {
   const sites = req.body;
   if (Array.isArray(sites)) {
-    sites.forEach((s) => saveSiteToDb(s));
+    sites.forEach((s) => {
+      saveSiteToDb(s);
+      syncSiteToFirestore(s).catch((err) => console.warn('Site granular sync notice:', err));
+    });
     const allSites = getSitesFromDb();
     broadcastChange('SITES_UPDATED', allSites);
     return res.json({ success: true, sites: allSites });
@@ -527,6 +553,7 @@ app.delete('/api/sites/:id', (req, res) => {
   if (deleted) {
     const allSites = getSitesFromDb();
     broadcastChange('SITES_UPDATED', allSites);
+    deleteSiteFromFirestore(id).catch((err) => console.warn('Site delete granular sync notice:', err));
     return res.json({ success: true, sites: allSites });
   }
   res.status(404).json({ success: false, message: 'Site not found' });
@@ -538,6 +565,7 @@ app.post('/api/hospital', (req, res) => {
     setSystemConfig('hospitalZone', zone);
     persistDatabase();
     broadcastChange('HOSPITAL_UPDATED', zone);
+    syncConfigToFirestore('hospitalZone', zone).catch((err) => console.warn('Hospital zone granular sync notice:', err));
     return res.json({ success: true, hospitalZone: zone });
   }
   res.status(400).json({ success: false, message: 'Invalid hospital zone' });
@@ -549,6 +577,7 @@ app.post('/api/master', (req, res) => {
     setSystemConfig('masterConfig', config);
     persistDatabase();
     broadcastChange('MASTER_UPDATED', config);
+    syncConfigToFirestore('masterConfig', config).catch((err) => console.warn('Master config granular sync notice:', err));
     return res.json({ success: true, masterConfig: config });
   }
   res.status(400).json({ success: false, message: 'Invalid master config' });
@@ -561,7 +590,10 @@ app.get('/api/holidays', (_req, res) => {
 app.post('/api/holidays', (req, res) => {
   const holidays = req.body;
   if (Array.isArray(holidays)) {
-    holidays.forEach((h) => saveHolidayToDb(h));
+    holidays.forEach((h) => {
+      saveHolidayToDb(h);
+      syncHolidayToFirestore(h).catch((err) => console.warn('Holiday granular sync notice:', err));
+    });
     const allHols = getHolidaysFromDb();
     broadcastChange('HOLIDAYS_UPDATED', allHols);
     return res.json({ success: true, holidays: allHols });
@@ -574,6 +606,7 @@ app.delete('/api/holidays/:fecha', (req, res) => {
   deleteHolidayFromDb(fecha);
   const allHols = getHolidaysFromDb();
   broadcastChange('HOLIDAYS_UPDATED', allHols);
+  deleteHolidayFromFirestore(fecha).catch((err) => console.warn('Holiday delete granular sync notice:', err));
   res.json({ success: true, holidays: allHols });
 });
 
@@ -587,10 +620,6 @@ app.post('/api/full-backup', (req, res) => {
   persistDatabase();
   const snapshot = getAllDataSnapshot();
   broadcastChange('FULL_STATE_UPDATED', snapshot);
-
-  if (isFirestoreConfigured()) {
-    syncAllToFirestore().catch((err) => console.warn('Firestore full-backup replication notice:', err));
-  }
 
   res.json({ success: true, state: snapshot });
 });
@@ -621,26 +650,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ClinicasTrack Server running on http://0.0.0.0:${PORT}`);
-
-    // Asynchronously hydrate or seed with Firestore in the background after server is listening
-    if (isFirestoreConfigured()) {
-      console.log('🌐 Google Cloud Firestore configured. Checking hydration in background...');
-      pullFromFirestoreToCache()
-        .then(async (pullRes) => {
-          if (pullRes.success) {
-            console.log(
-              `✅ [Startup Hydration] Pulled ${pullRes.details?.studentsCount || 0} students, ${pullRes.details?.sitesCount || 0} sites, ${pullRes.details?.recordsCount || 0} records from Firestore.`
-            );
-            if ((pullRes.details?.studentsCount || 0) === 0) {
-              console.log('ℹ️ Firestore is empty. Seeding local state to Firestore in background...');
-              await syncAllToFirestore();
-            }
-          }
-        })
-        .catch((err) => {
-          console.warn('⚠️ Firestore startup hydration notice:', err);
-        });
-    }
+    console.log('⚡ Local-first SQLite & in-memory cache ready. Zero automatic reads/writes to Firestore on startup.');
   });
 }
 
