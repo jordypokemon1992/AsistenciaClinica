@@ -1,0 +1,10 @@
+{
+  "name": "Control de Asistencia Hospitalaria",
+  "description": "Sistema de asistencia médica para alumnos en unidades hospitalarias con geocerca GPS, registro de dispositivo único por matrícula y panel docente.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

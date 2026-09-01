@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "students": {
+      "title": "Students",
+      "description": "Lista de alumnos inscritos en el sistema de clínicas",
+      "properties": {
+        "id": { "type": "string" },
+        "matricula": { "type": "string" },
+        "nombre": { "type": "string" },
+        "email": { "type": "string" },
+        "grupo": { "type": "string" },
+        "equipo": { "type": "string" },
+        "sedeId": { "type": "string" },
+        "sedeNombre": { "type": "string" }
+      },
+      "required": ["id", "matricula", "nombre"]
+    },
+    "attendance_records": {
+      "title": "Attendance Records",
+      "description": "Registros de checadas de asistencia georreferenciadas",
+      "properties": {
+        "id": { "type": "string" },
+        "studentId": { "type": "string" },
+        "fecha": { "type": "string" },
+        "checkInStatus": { "type": "string" }
+      },
+      "required": ["id", "studentId", "fecha", "checkInStatus"]
+    },
+    "hospital_sites": {
+      "title": "Hospital Sites",
+      "description": "Sedes hospitalarias y geocercas configuradas",
+      "properties": {
+        "id": { "type": "string" },
+        "nombre": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "radiusMeters": { "type": "number" }
+      },
+      "required": ["id", "nombre", "latitude", "longitude"]
+    }
+  }
+}
