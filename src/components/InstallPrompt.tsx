@@ -86,7 +86,7 @@ export const InstallPrompt: React.FC = () => {
 
             <div className="flex items-center gap-3 mb-4">
               <div className="w-12 h-12 rounded-xl bg-sky-600 flex items-center justify-center text-white shadow-lg overflow-hidden border border-sky-400/30">
-                <img src="/icon-192.png" alt="Icono App" className="w-full h-full object-cover" />
+                <img src="/icon-192.png" alt="Icono App" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
               </div>
               <div>
                 <h3 className="font-bold text-base text-white">Instalar ClinicasTrack</h3>

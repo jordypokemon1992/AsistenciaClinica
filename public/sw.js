@@ -1,4 +1,4 @@
-const CACHE_NAME = 'clinicas-track-cache-v5';
+const CACHE_NAME = 'clinicas-track-cache-v6';
 const STATIC_ASSETS = [
   '/manifest.json',
   '/favicon.png',
