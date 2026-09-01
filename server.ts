@@ -303,9 +303,6 @@ app.post('/api/students', (req, res) => {
     saveMultipleStudentsToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
-    body.forEach((st) => {
-      syncStudentToFirestore(st).catch((err) => console.warn('Student granular sync notice:', err));
-    });
     return res.json({ success: true, students: updatedList });
   } else if (body && typeof body === 'object') {
     const saved = saveStudentToDb(body);
@@ -498,7 +495,6 @@ app.post('/api/records', (req, res) => {
     body.forEach((rec) => {
       if (rec && rec.id) {
         saveRecordToDb(rec);
-        syncRecordToFirestore(rec).catch((err) => console.warn('Record granular sync notice:', err));
       }
     });
     const all = getRecordsFromDb();

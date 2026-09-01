@@ -104,8 +104,16 @@ export function mergeClientStudentSafely(existing: Student | null | undefined, i
   };
 }
 
-// Sync helper from Express Backend API
+// Sync helper from Express Backend API (Client reads authoritative server state)
+let isSyncingBackend = false;
+let pendingSyncAgain = false;
+
 export async function syncFromExpressBackend(): Promise<void> {
+  if (isSyncingBackend) {
+    pendingSyncAgain = true;
+    return;
+  }
+  isSyncingBackend = true;
   try {
     const res = await fetch('/api/sync');
     if (res.ok) {
@@ -115,77 +123,24 @@ export async function syncFromExpressBackend(): Promise<void> {
         localStorage.setItem(KEYS.SITES, JSON.stringify(data.sites));
       }
       if (Array.isArray(data.students)) {
-        const localRawStudents = localStorage.getItem(KEYS.STUDENTS);
-        const localStudents: Student[] = localRawStudents ? JSON.parse(localRawStudents) : [];
-        const localStudentMap = new Map<string, Student>();
-        localStudents.forEach((st) => {
-          if (st) {
-            if (st.id) localStudentMap.set(st.id, st);
-            if (st.matricula) localStudentMap.set(st.matricula.trim(), st);
-          }
-        });
-
-        const mergedStudents = (data.students as Student[]).map((st) => {
-          const found = localStudentMap.get(st.id) || (st.matricula ? localStudentMap.get(st.matricula.trim()) : null);
-          return mergeClientStudentSafely(found, st);
-        });
-
-        const serverStudentIds = new Set((data.students as Student[]).map((s) => s.id));
-        const serverMatriculas = new Set((data.students as Student[]).filter((s) => s.matricula).map((s) => String(s.matricula).trim()));
-
-        // Also preserve any locally created students that haven't reached the server yet
-        const localOnlyStudents = localStudents.filter((ls) => {
-          if (!ls || !ls.id) return false;
-          if (serverStudentIds.has(ls.id)) return false;
-          if (ls.matricula && serverMatriculas.has(String(ls.matricula).trim())) return false;
-          return true;
-        });
-
-        const finalMergedStudents = [...mergedStudents, ...localOnlyStudents];
-        localStorage.setItem(KEYS.STUDENTS, JSON.stringify(finalMergedStudents));
-
-        // If there were local students not on the server, push them
-        if (localOnlyStudents.length > 0) {
-          fetch('/api/students', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(localOnlyStudents),
-          }).catch(console.warn);
-        }
+        localStorage.setItem(KEYS.STUDENTS, JSON.stringify(data.students.map(sanitizeStudentSchedules)));
       }
       if (data.masterConfig) localStorage.setItem(KEYS.MASTER, JSON.stringify(data.masterConfig));
       if (Array.isArray(data.holidays)) {
         localStorage.setItem(KEYS.HOLIDAYS, JSON.stringify(data.holidays));
       }
-
-      // Non-destructive bidirectional merge for attendance records
       if (Array.isArray(data.records)) {
-        const localRaw = localStorage.getItem(KEYS.RECORDS);
-        const localRecords: AttendanceRecord[] = localRaw ? JSON.parse(localRaw) : [];
-
-        const recordMap = new Map<string, AttendanceRecord>();
-        localRecords.forEach((r) => { if (r && r.id) recordMap.set(r.id, r); });
-        data.records.forEach((r: AttendanceRecord) => { if (r && r.id) recordMap.set(r.id, r); });
-
-        const mergedRecords = Array.from(recordMap.values());
-        localStorage.setItem(KEYS.RECORDS, JSON.stringify(mergedRecords));
-
-        // If local records had entries missing on the server, push only those new records
-        const serverIds = new Set((data.records as AttendanceRecord[]).map((r) => r.id));
-        const unsynced = localRecords.filter((r) => r && r.id && !serverIds.has(r.id));
-        if (unsynced.length > 0) {
-          fetch('/api/records', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(unsynced),
-          }).catch(console.warn);
-        }
+        localStorage.setItem(KEYS.RECORDS, JSON.stringify(data.records));
       }
-
-      autoHealStudentDevices();
     }
   } catch {
-    // Quietly ignore transient network/sync hiccups
+    // Quietly ignore transient network hiccups
+  } finally {
+    isSyncingBackend = false;
+    if (pendingSyncAgain) {
+      pendingSyncAgain = false;
+      syncFromExpressBackend().catch(() => {});
+    }
   }
 }
 
@@ -365,9 +320,6 @@ export function initializeStorage(): void {
   if (!localStorage.getItem(KEYS.MASTER)) {
     localStorage.setItem(KEYS.MASTER, JSON.stringify(INITIAL_MASTER_CONFIG));
   }
-
-  // Trigger non-blocking sync with Express backend
-  syncFromExpressBackend().catch(console.warn);
 }
 
 // Reset to initial demo state
@@ -1007,6 +959,17 @@ export function subscribeToCloudChanges(
   initializeStorage();
 
   let isSubscribed = true;
+  let debounceTimeout: any = null;
+
+  const triggerDebouncedSync = () => {
+    if (debounceTimeout) clearTimeout(debounceTimeout);
+    debounceTimeout = setTimeout(() => {
+      if (!isSubscribed) return;
+      syncFromExpressBackend().then(() => {
+        if (isSubscribed) onUpdate();
+      });
+    }, 300);
+  };
 
   // Initial sync from Express backend
   syncFromExpressBackend().then(() => {
@@ -1024,9 +987,7 @@ export function subscribeToCloudChanges(
     eventSource.onmessage = (_e) => {
       if (!isSubscribed) return;
       sseActive = true;
-      syncFromExpressBackend().then(() => {
-        if (isSubscribed) onUpdate();
-      });
+      triggerDebouncedSync();
     };
     eventSource.onerror = () => {
       sseActive = false;
@@ -1041,13 +1002,12 @@ export function subscribeToCloudChanges(
     if (!isSubscribed) return;
     if (sseActive) return; // SSE handles real-time push events
     if (typeof document !== 'undefined' && document.hidden) return; // Don't poll when tab is in background
-    syncFromExpressBackend().then(() => {
-      if (isSubscribed) onUpdate();
-    });
+    triggerDebouncedSync();
   }, 90000);
 
   return () => {
     isSubscribed = false;
+    if (debounceTimeout) clearTimeout(debounceTimeout);
     if (eventSource) {
       eventSource.close();
     }
