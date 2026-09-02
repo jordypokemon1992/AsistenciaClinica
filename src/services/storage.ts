@@ -123,14 +123,101 @@ export async function syncFromExpressBackend(): Promise<void> {
         localStorage.setItem(KEYS.SITES, JSON.stringify(data.sites));
       }
       if (Array.isArray(data.students)) {
-        localStorage.setItem(KEYS.STUDENTS, JSON.stringify(data.students.map(sanitizeStudentSchedules)));
+        const localStudents = getStudents();
+        const serverStudents = data.students.map(sanitizeStudentSchedules);
+
+        if (localStudents.length === 0) {
+          localStorage.setItem(KEYS.STUDENTS, JSON.stringify(serverStudents));
+        } else {
+          const localMap = new Map<string, Student>();
+          localStudents.forEach((s) => {
+            if (s.id) localMap.set(s.id, s);
+            if (s.matricula) localMap.set(String(s.matricula).trim().toLowerCase(), s);
+          });
+
+          const mergedStudents: Student[] = [];
+          const seenIds = new Set<string>();
+          const seenMats = new Set<string>();
+          const locallyNewerToPush: Student[] = [];
+
+          for (const sSt of serverStudents) {
+            const matKey = sSt.matricula ? String(sSt.matricula).trim().toLowerCase() : '';
+            const localMatch = (sSt.id ? localMap.get(sSt.id) : null) || (matKey ? localMap.get(matKey) : null);
+            
+            if (!localMatch) {
+              mergedStudents.push(sSt);
+              if (sSt.id) seenIds.add(sSt.id);
+              if (matKey) seenMats.add(matKey);
+            } else {
+              const localTime = localMatch.updatedAt ? new Date(localMatch.updatedAt).getTime() : 0;
+              const serverTime = sSt.updatedAt ? new Date(sSt.updatedAt).getTime() : 0;
+
+              const merged = mergeClientStudentSafely(localMatch, sSt);
+              mergedStudents.push(merged);
+              if (merged.id) seenIds.add(merged.id);
+              if (matKey) seenMats.add(matKey);
+
+              // If local version is strictly newer than what server sent, queue to push back to server
+              if (localTime > serverTime && localTime > 0) {
+                locallyNewerToPush.push(merged);
+              }
+            }
+          }
+
+          // Retain any local-only students that aren't on server yet
+          for (const lSt of localStudents) {
+            const matKey = lSt.matricula ? String(lSt.matricula).trim().toLowerCase() : '';
+            const alreadyPresent = (lSt.id && seenIds.has(lSt.id)) || (matKey && seenMats.has(matKey));
+            if (!alreadyPresent) {
+              mergedStudents.push(lSt);
+              locallyNewerToPush.push(lSt);
+            }
+          }
+
+          localStorage.setItem(KEYS.STUDENTS, JSON.stringify(mergedStudents));
+
+          // If there were newer local edits, push them to the server so server & cloud stay updated
+          if (locallyNewerToPush.length > 0) {
+            fetch('/api/students', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(locallyNewerToPush),
+            }).catch(console.warn);
+          }
+        }
       }
       if (data.masterConfig) localStorage.setItem(KEYS.MASTER, JSON.stringify(data.masterConfig));
       if (Array.isArray(data.holidays)) {
         localStorage.setItem(KEYS.HOLIDAYS, JSON.stringify(data.holidays));
       }
       if (Array.isArray(data.records)) {
-        localStorage.setItem(KEYS.RECORDS, JSON.stringify(data.records));
+        const localRecords = getAttendanceRecords();
+        if (localRecords.length === 0) {
+          localStorage.setItem(KEYS.RECORDS, JSON.stringify(data.records));
+        } else {
+          const recMap = new Map<string, AttendanceRecord>();
+          // Index server records
+          data.records.forEach((r: AttendanceRecord) => {
+            if (r && r.id) recMap.set(r.id, r);
+          });
+          // Keep local records not yet on server
+          const missingOnServer: AttendanceRecord[] = [];
+          localRecords.forEach((lr) => {
+            if (lr && lr.id && !recMap.has(lr.id)) {
+              recMap.set(lr.id, lr);
+              missingOnServer.push(lr);
+            }
+          });
+          const mergedRecords = Array.from(recMap.values());
+          localStorage.setItem(KEYS.RECORDS, JSON.stringify(mergedRecords));
+          if (missingOnServer.length > 0) {
+            fetch('/api/records', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(missingOnServer),
+            }).catch(console.warn);
+          }
+        }
       }
     }
   } catch {
@@ -650,7 +737,7 @@ export function saveStudent(student: Student): void {
   }).catch(console.warn);
 }
 
-export function saveStudentsList(studentsList: Student[]): void {
+export async function saveStudentsList(studentsList: Student[]): Promise<boolean> {
   const now = new Date().toISOString();
   const sanitizedList = studentsList.map((st) =>
     sanitizeStudentSchedules({
@@ -660,7 +747,7 @@ export function saveStudentsList(studentsList: Student[]): void {
   );
 
   const currentStudents = getStudents();
-  const updatedIdSet = new Set(sanitizedList.map((s) => s.id));
+  const updatedIdSet = new Set(sanitizedList.map((s) => s.id).filter(Boolean));
   const updatedMatSet = new Set(
     sanitizedList.filter((s) => s.matricula).map((s) => String(s.matricula).trim().toLowerCase())
   );
@@ -675,11 +762,17 @@ export function saveStudentsList(studentsList: Student[]): void {
   const mergedList = [...remaining, ...sanitizedList];
   localStorage.setItem(KEYS.STUDENTS, JSON.stringify(mergedList));
 
-  fetch('/api/students', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(sanitizedList),
-  }).catch(console.warn);
+  try {
+    const res = await fetch('/api/students', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sanitizedList),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('saveStudentsList fetch notice:', err);
+    return false;
+  }
 }
 
 export function deleteStudent(studentId: string): void {
@@ -801,13 +894,19 @@ export function getAttendanceRecords(): AttendanceRecord[] {
   }
 }
 
-// Download only the current student's records from server (fast and lightweight)
-export async function fetchStudentRecordsFromServer(matriculaOrId: string, startDate?: string, endDate?: string): Promise<AttendanceRecord[]> {
+// Download only the current student's records from server (fast and lightweight, optional cloud fetch for reports)
+export async function fetchStudentRecordsFromServer(
+  matriculaOrId: string,
+  startDate?: string,
+  endDate?: string,
+  fetchFromCloud = false
+): Promise<AttendanceRecord[]> {
   try {
     const params = new URLSearchParams();
     if (startDate) params.append('startDate', startDate);
     if (endDate) params.append('endDate', endDate);
-    params.append('limit', '80');
+    if (fetchFromCloud) params.append('fetchFromCloud', 'true');
+    params.append('limit', '250');
 
     const res = await fetch(`/api/students/${encodeURIComponent(matriculaOrId)}/records?${params.toString()}`);
     if (res.ok) {

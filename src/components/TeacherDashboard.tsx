@@ -30,6 +30,7 @@ import {
   StateDiffAnalysis,
   sanitizeStudentSchedules,
   fetchAttendanceStatsFromServer,
+  fetchStudentRecordsFromServer,
 } from '../services/storage';
 import {
   formatDateDisplay,
@@ -87,6 +88,7 @@ import {
   Radio,
   Database,
   ShieldAlert,
+  Loader2,
 } from 'lucide-react';
 import {
   normalizeSpanishDay,
@@ -305,6 +307,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
     Record<string, TeamScheduleState>
   >({});
   const [savedTeamAlert, setSavedTeamAlert] = useState<string | null>(null);
+  const [savingTeamKey, setSavingTeamKey] = useState<string | null>(null);
 
   // Estado para controlar qué paneles de horario de equipo están expandidos (por defecto todos minimizados)
   const [expandedTeams, setExpandedTeams] = useState<Record<string, boolean>>({});
@@ -324,7 +327,10 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
       return teamSchedules[teamKey];
     }
     const cleanStudents = (teamStudents || []).map(sanitizeStudentSchedules);
-    const sample = cleanStudents[0];
+    const sample =
+      cleanStudents.find((s) => s.horariosPorDia && s.horariosPorDia.length > 0) ||
+      cleanStudents.find((s) => s.diasAsistencia && s.diasAsistencia.length > 0) ||
+      cleanStudents[0];
     const days = sortDaysArray(
       sample?.diasAsistencia && sample.diasAsistencia.length > 0
         ? sample.diasAsistencia
@@ -455,7 +461,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
     }));
   };
 
-  const handleSaveTeamSchedule = (
+  const handleSaveTeamSchedule = async (
     teamKey: string,
     eqKey: string,
     teamStudents: Student[]
@@ -467,49 +473,74 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
       return;
     }
 
-    const sortedDays = sortDaysArray(current.days);
-    const teamStudentIds = new Set(teamStudents.map((s) => s.id));
+    setSavingTeamKey(teamKey);
+    try {
+      const sortedDays = sortDaysArray(current.days);
+      const teamStudentIds = new Set(teamStudents.map((s) => s.id).filter(Boolean));
+      const teamStudentMatriculas = new Set(
+        teamStudents.map((s) => String(s.matricula).trim().toLowerCase()).filter(Boolean)
+      );
 
-    const updatedStudentsList = students.map((st) => {
-      if (teamStudentIds.has(st.id)) {
-        const newHorariosPorDia = sortDaySchedules(sortedDays.map((dia) => {
-          const daySched = current.schedulesByDay[dia] || {
-            turnos: [{ horaEntrada: hospitalZone.horaEntrada || '07:00', horaSalida: hospitalZone.horaSalida || '15:00' }],
+      const isTeamMember = (st: Student) => {
+        if (st.id && teamStudentIds.has(st.id)) return true;
+        if (st.matricula && teamStudentMatriculas.has(String(st.matricula).trim().toLowerCase())) return true;
+        return false;
+      };
+
+      const updatedTeamStudents: Student[] = [];
+      students.forEach((st) => {
+        if (isTeamMember(st)) {
+          const newHorariosPorDia = sortDaySchedules(sortedDays.map((dia) => {
+            const daySched = current.schedulesByDay[dia] || {
+              turnos: [{ horaEntrada: hospitalZone.horaEntrada || '07:00', horaSalida: hospitalZone.horaSalida || '15:00' }],
+            };
+            const turnos = daySched.turnos && daySched.turnos.length > 0
+              ? daySched.turnos
+              : [{ horaEntrada: hospitalZone.horaEntrada || '07:00', horaSalida: hospitalZone.horaSalida || '15:00' }];
+
+            return {
+              dia,
+              horaEntrada: turnos[0].horaEntrada,
+              horaSalida: turnos[turnos.length - 1].horaSalida,
+              turnos,
+              toleranciaMinutos: st.toleranciaMinutos || hospitalZone.toleranciaMinutos || 15,
+            };
+          }));
+
+          const primaryEntrada = newHorariosPorDia[0]?.horaEntrada || st.horaEntrada || hospitalZone.horaEntrada || '07:00';
+          const primarySalida = newHorariosPorDia[0]?.horaSalida || st.horaSalida || hospitalZone.horaSalida || '15:00';
+
+          const updatedStudent: Student = {
+            ...st,
+            diasAsistencia: sortedDays,
+            horaEntrada: primaryEntrada,
+            horaSalida: primarySalida,
+            horariosPorDia: newHorariosPorDia,
           };
-          const turnos = daySched.turnos && daySched.turnos.length > 0
-            ? daySched.turnos
-            : [{ horaEntrada: hospitalZone.horaEntrada || '07:00', horaSalida: hospitalZone.horaSalida || '15:00' }];
+          updatedTeamStudents.push(updatedStudent);
+        }
+      });
 
-          return {
-            dia,
-            horaEntrada: turnos[0].horaEntrada,
-            horaSalida: turnos[turnos.length - 1].horaSalida,
-            turnos,
-            toleranciaMinutos: st.toleranciaMinutos || hospitalZone.toleranciaMinutos || 15,
-          };
-        }));
+      // Maintain in-memory state of this team schedule
+      setTeamSchedules((prev) => ({
+        ...prev,
+        [teamKey]: current,
+      }));
 
-        const primaryEntrada = newHorariosPorDia[0]?.horaEntrada || st.horaEntrada || hospitalZone.horaEntrada || '07:00';
-        const primarySalida = newHorariosPorDia[0]?.horaSalida || st.horaSalida || hospitalZone.horaSalida || '15:00';
+      // Persist only modified students for lightweight batch payload
+      await saveStudentsList(updatedTeamStudents);
+      onRefreshData();
 
-        return {
-          ...st,
-          diasAsistencia: sortedDays,
-          horaEntrada: primaryEntrada,
-          horaSalida: primarySalida,
-          horariosPorDia: newHorariosPorDia,
-        };
-      }
-      return st;
-    });
-
-    saveStudentsList(updatedStudentsList);
-    onRefreshData();
-
-    setSavedTeamAlert(teamKey);
-    setTimeout(() => {
-      setSavedTeamAlert(null);
-    }, 3500);
+      setSavedTeamAlert(teamKey);
+      setTimeout(() => {
+        setSavedTeamAlert(null);
+      }, 4000);
+    } catch (err) {
+      console.error('Error saving team schedule:', err);
+      alert('Error al guardar los horarios para el equipo.');
+    } finally {
+      setSavingTeamKey(null);
+    }
   };
 
   // Bitácora General Filters & Dates (default to current week)
@@ -616,6 +647,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
     setReportSelectedYear(new Date().getFullYear());
     setReportSelectedMonth(new Date().getMonth());
     setShowIndividualReportModal(true);
+
+    // Demand-driven: Fetch records exclusively for this student from server / cloud for official report
+    fetchStudentRecordsFromServer(student.matricula, undefined, undefined, true)
+      .then(() => {
+        onRefreshData();
+      })
+      .catch(() => {});
   };
 
   // Available Hospital Sites for student assignment
@@ -2492,11 +2530,25 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                               <div className="pt-2 flex justify-end">
                                 <button
                                   type="button"
+                                  disabled={savingTeamKey === teamKey}
                                   onClick={() => handleSaveTeamSchedule(teamKey, eqKey, teamStudents)}
-                                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-sm flex items-center gap-1.5 transition-all"
+                                  className={`px-5 py-2 text-white font-bold text-xs rounded-xl shadow-sm flex items-center gap-1.5 transition-all ${
+                                    savingTeamKey === teamKey
+                                      ? 'bg-emerald-400 cursor-not-allowed'
+                                      : 'bg-emerald-600 hover:bg-emerald-700 cursor-pointer'
+                                  }`}
                                 >
-                                  <Check className="w-4 h-4" />
-                                  <span>Guardar Horarios para {eqKey}</span>
+                                  {savingTeamKey === teamKey ? (
+                                    <>
+                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                      <span>Guardando en BD y Nube...</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Check className="w-4 h-4" />
+                                      <span>Guardar Horarios para {eqKey}</span>
+                                    </>
+                                  )}
                                 </button>
                               </div>
                             </div>

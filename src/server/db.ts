@@ -12,10 +12,12 @@ import {
 import { eq, and, gte, lte, sql } from 'drizzle-orm';
 import {
   syncStudentToFirestore,
+  syncMultipleStudentsToFirestore,
   deleteStudentFromFirestore,
   syncSiteToFirestore,
   deleteSiteFromFirestore,
   syncRecordToFirestore,
+  syncMultipleRecordsToFirestore,
   deleteRecordFromFirestore,
   syncHolidayToFirestore,
   deleteHolidayFromFirestore,
@@ -646,44 +648,60 @@ export function importFullSnapshotToSqlite(data: any, mode: 'merge' | 'replace' 
           studentsAdded++;
         }
 
-        const linkedDeviceId = st.linkedDeviceId !== undefined && st.linkedDeviceId !== null
-          ? st.linkedDeviceId
-          : (existing?.linkedDeviceId || null);
-        const linkedDeviceName = st.linkedDeviceName !== undefined && st.linkedDeviceName !== null
-          ? st.linkedDeviceName
-          : (existing?.linkedDeviceName || null);
-        const linkedAt = st.linkedAt !== undefined && st.linkedAt !== null
-          ? st.linkedAt
-          : (existing?.linkedAt || null);
+        const existingTime = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+        const incomingTime = (st.updatedAt || st._updatedAt) ? new Date(st.updatedAt || st._updatedAt).getTime() : 0;
+        const isExistingNewer = mode === 'merge' && existingTime > incomingTime && incomingTime > 0;
 
-        const hasIncomingSched = Array.isArray(st.horariosPorDia) && st.horariosPorDia.length > 0;
-        const horariosPorDia = hasIncomingSched
-          ? st.horariosPorDia
-          : (existing?.horariosPorDia || st.horariosPorDia || []);
+        const primary = isExistingNewer ? existing : st;
+        const secondary = isExistingNewer ? st : existing;
 
-        const hasIncomingDias = Array.isArray(st.diasAsistencia) && st.diasAsistencia.length > 0;
-        const diasAsistencia = hasIncomingDias
-          ? st.diasAsistencia
-          : (existing?.diasAsistencia || st.diasAsistencia || (horariosPorDia.length > 0 ? horariosPorDia.map((h: any) => h.dia) : ['Lunes', 'Miércoles']));
+        const linkedDeviceId = primary.linkedDeviceId !== undefined && primary.linkedDeviceId !== null
+          ? primary.linkedDeviceId
+          : (secondary?.linkedDeviceId || null);
+        const linkedDeviceName = primary.linkedDeviceName !== undefined && primary.linkedDeviceName !== null
+          ? primary.linkedDeviceName
+          : (secondary?.linkedDeviceName || null);
+        const linkedAt = primary.linkedAt !== undefined && primary.linkedAt !== null
+          ? primary.linkedAt
+          : (secondary?.linkedAt || null);
+
+        const hasPrimarySched = Array.isArray(primary.horariosPorDia) && primary.horariosPorDia.length > 0;
+        const hasSecondarySched = Array.isArray(secondary?.horariosPorDia) && secondary.horariosPorDia.length > 0;
+        const horariosPorDia = hasPrimarySched
+          ? primary.horariosPorDia
+          : (hasSecondarySched ? secondary.horariosPorDia : []);
+
+        const hasPrimaryDias = Array.isArray(primary.diasAsistencia) && primary.diasAsistencia.length > 0;
+        const hasSecondaryDias = Array.isArray(secondary?.diasAsistencia) && secondary.diasAsistencia.length > 0;
+        const diasAsistencia = hasPrimaryDias
+          ? primary.diasAsistencia
+          : (hasSecondaryDias ? secondary.diasAsistencia : (horariosPorDia.length > 0 ? horariosPorDia.map((h: any) => h.dia) : ['Lunes', 'Miércoles']));
 
         const fullStudent = {
-          ...existing,
-          ...st,
+          ...secondary,
+          ...primary,
           id: existing?.id || studentId,
           matricula,
+          nombre: primary.nombre || secondary?.nombre || '',
+          email: primary.email || secondary?.email || '',
+          grupo: primary.grupo || secondary?.grupo || '10 A',
+          equipo: primary.equipo || secondary?.equipo || 'Equipo 1',
+          especialidad: primary.especialidad || secondary?.especialidad || 'Urgencias Médicas',
+          rotacion: primary.rotacion || secondary?.rotacion || 'Urgencias Médicas',
           diasAsistencia,
           horariosPorDia,
-          horaEntrada: st.horaEntrada || (horariosPorDia[0]?.horaEntrada) || existing?.horaEntrada || '07:00',
-          horaSalida: st.horaSalida || (horariosPorDia[0]?.horaSalida) || existing?.horaSalida || '15:00',
-          toleranciaMinutos: st.toleranciaMinutos !== undefined ? st.toleranciaMinutos : (existing?.toleranciaMinutos ?? 15),
-          sedeId: st.sedeId || existing?.sedeId || 'site-1',
-          sedeNombre: st.sedeNombre || existing?.sedeNombre || 'Hospital General Los Mochis',
-          secondarySedeId: st.secondarySedeId !== undefined ? st.secondarySedeId : (existing?.secondarySedeId || null),
-          secondarySedeNombre: st.secondarySedeNombre !== undefined ? st.secondarySedeNombre : (existing?.secondarySedeNombre || null),
+          horaEntrada: primary.horaEntrada || (horariosPorDia[0]?.horaEntrada) || secondary?.horaEntrada || '07:00',
+          horaSalida: primary.horaSalida || (horariosPorDia[0]?.horaSalida) || secondary?.horaSalida || '15:00',
+          toleranciaMinutos: primary.toleranciaMinutos !== undefined ? primary.toleranciaMinutos : (secondary?.toleranciaMinutos ?? 15),
+          sedeId: primary.sedeId || secondary?.sedeId || 'site-1',
+          sedeNombre: primary.sedeNombre || secondary?.sedeNombre || 'Hospital General Los Mochis',
+          secondarySedeId: primary.secondarySedeId !== undefined ? primary.secondarySedeId : (secondary?.secondarySedeId || null),
+          secondarySedeNombre: primary.secondarySedeNombre !== undefined ? primary.secondarySedeNombre : (secondary?.secondarySedeNombre || null),
           linkedDeviceId,
           linkedDeviceName,
           linkedAt,
-          updatedAt: new Date().toISOString(),
+          activo: primary.activo !== undefined ? primary.activo : (secondary?.activo !== undefined ? secondary.activo : true),
+          updatedAt: isExistingNewer ? existing.updatedAt : (st.updatedAt || st._updatedAt || new Date().toISOString()),
         };
 
         const diasAsistenciaStr = JSON.stringify(fullStudent.diasAsistencia || []);
@@ -1235,7 +1253,7 @@ export function getStudentByMatriculaOrIdFromDb(identifier: string): any | null 
   return null;
 }
 
-export function saveStudentToDb(student: any, persist = true): any {
+export function saveStudentToDb(student: any, persist = true, syncFirestore = true): any {
   if (!db || !student) return null;
   const matricula = String(student.matricula || '').trim();
   if (!matricula) return null;
@@ -1370,7 +1388,9 @@ export function saveStudentToDb(student: any, persist = true): any {
       .catch((err) => markCloudSqlUnavailable(err));
   }
 
-  syncStudentToFirestore(fullStudent).catch(() => {});
+  if (syncFirestore) {
+    syncStudentToFirestore(fullStudent).catch(() => {});
+  }
 
   return fullStudent;
 }
@@ -1383,7 +1403,7 @@ export function saveMultipleStudentsToDb(studentsList: any[]): any[] {
     db.run('BEGIN TRANSACTION');
     inTx = true;
     for (const st of studentsList) {
-      const saved = saveStudentToDb(st, false);
+      const saved = saveStudentToDb(st, false, false);
       if (saved) results.push(saved);
     }
     db.run('COMMIT');
@@ -1395,6 +1415,7 @@ export function saveMultipleStudentsToDb(studentsList: any[]): any[] {
     console.error('Error saving batch students to SQLite:', err);
   }
   persistDatabase();
+  syncMultipleStudentsToFirestore(results).catch((err) => console.warn('Batch students sync notice:', err));
   return results;
 }
 

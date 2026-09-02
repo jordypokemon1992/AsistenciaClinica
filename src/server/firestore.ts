@@ -10,6 +10,8 @@ import {
   writeBatch,
   getDoc,
   getCountFromServer,
+  query,
+  where,
   DocumentData,
 } from 'firebase/firestore';
 import fs from 'fs';
@@ -204,10 +206,10 @@ export async function syncAllToFirestore(): Promise<{
       for (const site of snapshot.sites) {
         if (!site || !site.id) continue;
         const ref = doc(dbClient, 'sites', String(site.id));
-        siteBatch.set(ref, {
+        siteBatch.set(ref, cleanForFirestore({
           ...site,
           _updatedAt: new Date().toISOString(),
-        }, { merge: true });
+        }), { merge: true });
         siteCount++;
       }
       await siteBatch.commit();
@@ -219,10 +221,10 @@ export async function syncAllToFirestore(): Promise<{
       for (const hol of snapshot.holidays) {
         if (!hol || !hol.fecha) continue;
         const ref = doc(dbClient, 'holidays', String(hol.fecha));
-        holBatch.set(ref, {
+        holBatch.set(ref, cleanForFirestore({
           ...hol,
           _updatedAt: new Date().toISOString(),
-        }, { merge: true });
+        }), { merge: true });
         holidayCount++;
       }
       await holBatch.commit();
@@ -238,10 +240,10 @@ export async function syncAllToFirestore(): Promise<{
           if (!st || !st.matricula) continue;
           const docId = String(st.id || `std-${st.matricula}`);
           const ref = doc(dbClient, 'students', docId);
-          batch.set(ref, {
+          batch.set(ref, cleanForFirestore({
             ...st,
             _updatedAt: new Date().toISOString(),
-          }, { merge: true });
+          }), { merge: true });
           studentCount++;
         }
         await batch.commit();
@@ -257,10 +259,10 @@ export async function syncAllToFirestore(): Promise<{
         for (const rec of chunk) {
           if (!rec || !rec.id) continue;
           const ref = doc(dbClient, 'attendance_records', String(rec.id));
-          batch.set(ref, {
+          batch.set(ref, cleanForFirestore({
             ...rec,
             _updatedAt: new Date().toISOString(),
-          }, { merge: true });
+          }), { merge: true });
           recordCount++;
         }
         await batch.commit();
@@ -270,11 +272,11 @@ export async function syncAllToFirestore(): Promise<{
     // 5. Sync System Config
     if (snapshot.hospitalZone || snapshot.masterConfig) {
       const configRef = doc(dbClient, 'system_config', 'main');
-      await setDoc(configRef, {
+      await setDoc(configRef, cleanForFirestore({
         hospitalZone: snapshot.hospitalZone || null,
         masterConfig: snapshot.masterConfig || null,
         _lastSync: new Date().toISOString(),
-      }, { merge: true });
+      }), { merge: true });
     }
 
     lastSyncTimestamp = Date.now();
@@ -301,9 +303,152 @@ export async function syncAllToFirestore(): Promise<{
   }
 }
 
+// Helper to get the Monday of the current week (YYYY-MM-DD)
+export function getCurrentWeekMondayStr(date: Date = new Date()): string {
+  const d = new Date(date);
+  const day = d.getDay(); // 0 is Sunday, 1 is Monday, ..., 6 is Saturday
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(d);
+  monday.setDate(diff);
+  return monday.toISOString().slice(0, 10);
+}
+
+// Debounced touch of system_config/main to record latest cloud data timestamp
+let touchCloudConfigTimer: NodeJS.Timeout | null = null;
+export function touchCloudDataUpdatedAt(): void {
+  if (!isFirestoreConfigured() || isCircuitOpen()) return;
+
+  if (touchCloudConfigTimer) {
+    clearTimeout(touchCloudConfigTimer);
+  }
+  touchCloudConfigTimer = setTimeout(async () => {
+    touchCloudConfigTimer = null;
+    try {
+      const dbClient = getFirestoreClient();
+      if (!dbClient) return;
+      const configRef = doc(dbClient, 'system_config', 'main');
+      await setDoc(configRef, {
+        _lastDataUpdatedAt: new Date().toISOString(),
+      }, { merge: true });
+    } catch {
+      // Non-fatal
+    }
+  }, 1200);
+}
+
+// ----------------- SMART STARTUP 1-READ RECONCILIATION -----------------
+
+export async function reconcileStartupFromFirestore(): Promise<{
+  success: boolean;
+  message: string;
+  skipped?: boolean;
+  details?: any;
+}> {
+  if (!isFirestoreConfigured()) {
+    return { success: false, message: 'Firebase Firestore no configurado.' };
+  }
+  if (isCircuitOpen()) {
+    return { success: false, message: 'Protección activa temporalmente en Firestore.' };
+  }
+
+  const dbClient = getFirestoreClient();
+  if (!dbClient) {
+    return { success: false, message: 'No se pudo inicializar Firestore.' };
+  }
+
+  try {
+    const { getStudentsFromDb, getRecordsFromDb, getSystemConfig, setSystemConfig } = await import('./db');
+    const localStudents = getStudentsFromDb();
+    const localRecords = getRecordsFromDb();
+
+    // 1. If local database has 0 students (container freshly started without local state or wiped disk),
+    // we must hydrate from Firestore.
+    if (localStudents.length === 0) {
+      console.log('📦 [Arranque] Contenedor nuevo o disco vacío detectado (0 alumnos locales). Descargando datos iniciales desde Firestore...');
+      return await pullFromFirestoreToCache({ forceFull: false, onlyCurrentWeekRecords: true });
+    }
+
+    // 2. ⚡ VERIFICACIÓN PREVIA DE 1 SOLA LECTURA
+    console.log('⚡ [1 Sola Lectura] Verificando documento de control system_config/main en Firestore...');
+    const configSnap = await getDoc(doc(dbClient, 'system_config', 'main'));
+
+    if (!configSnap.exists()) {
+      console.log(`⚡ [1 Sola Lectura] No existe system_config/main en Firestore. Se conservan ${localStudents.length} alumnos locales intactos.`);
+      return {
+        success: true,
+        message: `Base de datos local activa (${localStudents.length} alumnos). No existe metadata remota previa.`,
+        skipped: true,
+      };
+    }
+
+    const cloudData = configSnap.data();
+    const cloudLastSync = cloudData._lastDataUpdatedAt || cloudData._lastSync || cloudData._updatedAt || null;
+    const cloudTime = cloudLastSync ? new Date(cloudLastSync).getTime() : 0;
+
+    const localMeta = getSystemConfig('cloud_sync_checkpoint', null);
+    const localLastSyncTime = localMeta?.lastCloudSyncTime ? Number(localMeta.lastCloudSyncTime) : 0;
+
+    // Check maximum updatedAt timestamp among local students
+    let latestLocalStudentTime = 0;
+    for (const st of localStudents) {
+      const t = st.updatedAt ? new Date(st.updatedAt).getTime() : 0;
+      if (t > latestLocalStudentTime) latestLocalStudentTime = t;
+    }
+
+    // If local database has already synced this exact cloud state, or local timestamp is newer/equal to cloud:
+    const isUpToDate =
+      (localLastSyncTime > 0 && localLastSyncTime >= cloudTime) ||
+      (cloudTime > 0 && localMeta?.lastCloudSync === cloudLastSync) ||
+      (latestLocalStudentTime > 0 && latestLocalStudentTime >= cloudTime);
+
+    if (isUpToDate) {
+      // Record checkpoint locally in SQLite
+      setSystemConfig('cloud_sync_checkpoint', {
+        lastCloudSync: cloudLastSync,
+        lastCloudSyncTime: Math.max(cloudTime, latestLocalStudentTime),
+        studentsCount: localStudents.length,
+        recordsCount: localRecords.length,
+        verifiedAt: new Date().toISOString(),
+      });
+
+      console.log(`⚡ [Verificación 1 Sola Lectura Éxito] Base de datos local al día con la nube (${localStudents.length} alumnos, ${localRecords.length} checadas). 0 lecturas adicionales.`);
+      return {
+        success: true,
+        message: `Base de datos local al día con Firestore (${localStudents.length} alumnos). Se consumió exactamente 1 sola lectura de verificación.`,
+        skipped: true,
+      };
+    }
+
+    // 3. Cloud has newer changes! Download only what changed, bringing only this week's records to save reads
+    console.log(`🔄 [Actualización Detectada] La nube contiene cambios más recientes (${cloudLastSync}). Descargando datos (alumnos, sedes y checadas de la semana en curso)...`);
+    const pullResult = await pullFromFirestoreToCache({ forceFull: false, onlyCurrentWeekRecords: true });
+
+    if (pullResult.success) {
+      setSystemConfig('cloud_sync_checkpoint', {
+        lastCloudSync: cloudLastSync,
+        lastCloudSyncTime: cloudTime,
+        studentsCount: pullResult.details?.studentsCount || localStudents.length,
+        recordsCount: pullResult.details?.recordsCount || localRecords.length,
+        verifiedAt: new Date().toISOString(),
+      });
+    }
+
+    return pullResult;
+  } catch (err: any) {
+    handleOperationError(err, 'reconcileStartupFromFirestore');
+    return {
+      success: false,
+      message: `Error al verificar estado de inicio en Firestore: ${err?.message || err}`,
+    };
+  }
+}
+
 // ----------------- PULL FROM FIRESTORE TO LOCAL CACHE -----------------
 
-export async function pullFromFirestoreToCache(forceFull = false): Promise<{
+export async function pullFromFirestoreToCache(options: {
+  forceFull?: boolean;
+  onlyCurrentWeekRecords?: boolean;
+} | boolean = false): Promise<{
   success: boolean;
   message: string;
   changed?: boolean;
@@ -314,6 +459,9 @@ export async function pullFromFirestoreToCache(forceFull = false): Promise<{
     holidaysCount: number;
   };
 }> {
+  const forceFull = typeof options === 'boolean' ? options : !!options.forceFull;
+  const onlyCurrentWeek = typeof options === 'boolean' ? !options : (options.onlyCurrentWeekRecords !== false);
+
   if (!isFirestoreConfigured()) {
     return { success: false, message: 'Firebase Firestore no configurado.' };
   }
@@ -347,8 +495,21 @@ export async function pullFromFirestoreToCache(forceFull = false): Promise<{
       }
     });
 
-    // 3. Fetch Records
-    const recordsSnap = await getDocs(collection(dbClient, 'attendance_records'));
+    // 3. Fetch Records: OPTIMIZED FOR CURRENT WEEK ONLY BY DEFAULT
+    let recordsSnap;
+    if (onlyCurrentWeek && !forceFull) {
+      const mondayStr = getCurrentWeekMondayStr();
+      const recordsQuery = query(
+        collection(dbClient, 'attendance_records'),
+        where('fecha', '>=', mondayStr)
+      );
+      recordsSnap = await getDocs(recordsQuery);
+      console.log(`📅 [Carga Optimizada] Descargando checadas recientes desde inicio de semana (${mondayStr}): ${recordsSnap.size} checadas.`);
+    } else {
+      recordsSnap = await getDocs(collection(dbClient, 'attendance_records'));
+      console.log(`📅 [Carga Completa] Descargando todo el histórico de checadas: ${recordsSnap.size} registros leídos.`);
+    }
+
     const records: any[] = [];
     recordsSnap.forEach((docSnap) => {
       const data = docSnap.data();
@@ -402,7 +563,7 @@ export async function pullFromFirestoreToCache(forceFull = false): Promise<{
 
     return {
       success: true,
-      message: `Datos recuperados de Firestore: ${students.length} alumnos, ${records.length} checadas, ${sites.length} sedes, ${holidays.length} días inhábiles.`,
+      message: `Datos sincronizados de Firestore: ${students.length} alumnos, ${records.length} checadas (${onlyCurrentWeek && !forceFull ? 'semana actual' : 'histórico'}), ${sites.length} sedes, ${holidays.length} días inhábiles.`,
       changed: true,
       details: {
         studentsCount: students.length,
@@ -420,7 +581,80 @@ export async function pullFromFirestoreToCache(forceFull = false): Promise<{
   }
 }
 
+// ----------------- DEMAND-DRIVEN RECORD PULL FOR SPECIFIC STUDENT -----------------
+
+export async function fetchStudentRecordsFromFirestore(matricula: string): Promise<any[]> {
+  const cleanMat = String(matricula || '').trim();
+  if (!isFirestoreConfigured() || isCircuitOpen() || !cleanMat) return [];
+  const dbClient = getFirestoreClient();
+  if (!dbClient) return [];
+
+  try {
+    console.log(`📄 [Reporte Individual] Consultando checadas en Firestore exclusivamente para matrícula ${cleanMat}...`);
+    const q = query(
+      collection(dbClient, 'attendance_records'),
+      where('matricula', '==', cleanMat)
+    );
+    const snap = await getDocs(q);
+    const records: any[] = [];
+    snap.forEach((docSnap) => {
+      const data = docSnap.data();
+      if (data && data.id) {
+        records.push(data);
+      }
+    });
+
+    if (records.length > 0) {
+      const { saveRecordToDb, persistDatabase } = await import('./db');
+      records.forEach((rec) => {
+        saveRecordToDb(rec);
+      });
+      persistDatabase(false);
+      console.log(`📄 [Reporte Individual] ${records.length} checadas integradas al caché local para ${cleanMat}.`);
+    }
+    handleOperationSuccess();
+    return records;
+  } catch (err) {
+    handleOperationError(err, 'fetchStudentRecordsFromFirestore');
+    return [];
+  }
+}
+
+function cleanForFirestore<T>(data: T): any {
+  if (data === undefined || data === null) return null;
+  return JSON.parse(JSON.stringify(data));
+}
+
 // ----------------- GRANULAR WRITE-THROUGH OPERATIONS -----------------
+
+export async function syncMultipleStudentsToFirestore(students: any[]): Promise<void> {
+  if (!isFirestoreConfigured() || isCircuitOpen() || !Array.isArray(students) || students.length === 0) return;
+  const dbClient = getFirestoreClient();
+  if (!dbClient) return;
+
+  try {
+    const CHUNK_SIZE = 400;
+    for (let i = 0; i < students.length; i += CHUNK_SIZE) {
+      const chunk = students.slice(i, i + CHUNK_SIZE);
+      const batch = writeBatch(dbClient);
+      for (const st of chunk) {
+        if (!st || !st.matricula) continue;
+        const docId = String(st.id || `std-${st.matricula}`);
+        const ref = doc(dbClient, 'students', docId);
+        const payload = cleanForFirestore({
+          ...st,
+          _updatedAt: new Date().toISOString(),
+        });
+        batch.set(ref, payload, { merge: true });
+      }
+      await batch.commit();
+    }
+    handleOperationSuccess();
+    touchCloudDataUpdatedAt();
+  } catch (err) {
+    handleOperationError(err, 'syncMultipleStudentsToFirestore');
+  }
+}
 
 export async function syncStudentToFirestore(student: any): Promise<void> {
   if (!isFirestoreConfigured() || isCircuitOpen() || !student || !student.matricula) return;
@@ -430,11 +664,13 @@ export async function syncStudentToFirestore(student: any): Promise<void> {
   try {
     const docId = String(student.id || `std-${student.matricula}`);
     const ref = doc(dbClient, 'students', docId);
-    await setDoc(ref, {
+    const payload = cleanForFirestore({
       ...student,
       _updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
+    await setDoc(ref, payload, { merge: true });
     handleOperationSuccess();
+    touchCloudDataUpdatedAt();
   } catch (err) {
     handleOperationError(err, 'syncStudentToFirestore');
   }
@@ -449,8 +685,37 @@ export async function deleteStudentFromFirestore(studentId: string): Promise<voi
     const ref = doc(dbClient, 'students', String(studentId));
     await deleteDoc(ref);
     handleOperationSuccess();
+    touchCloudDataUpdatedAt();
   } catch (err) {
     handleOperationError(err, 'deleteStudentFromFirestore');
+  }
+}
+
+export async function syncMultipleRecordsToFirestore(records: any[]): Promise<void> {
+  if (!isFirestoreConfigured() || isCircuitOpen() || !Array.isArray(records) || records.length === 0) return;
+  const dbClient = getFirestoreClient();
+  if (!dbClient) return;
+
+  try {
+    const CHUNK_SIZE = 400;
+    for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+      const chunk = records.slice(i, i + CHUNK_SIZE);
+      const batch = writeBatch(dbClient);
+      for (const rec of chunk) {
+        if (!rec || !rec.id) continue;
+        const ref = doc(dbClient, 'attendance_records', String(rec.id));
+        const payload = cleanForFirestore({
+          ...rec,
+          _updatedAt: new Date().toISOString(),
+        });
+        batch.set(ref, payload, { merge: true });
+      }
+      await batch.commit();
+    }
+    handleOperationSuccess();
+    touchCloudDataUpdatedAt();
+  } catch (err) {
+    handleOperationError(err, 'syncMultipleRecordsToFirestore');
   }
 }
 
@@ -461,11 +726,13 @@ export async function syncRecordToFirestore(record: any): Promise<void> {
 
   try {
     const ref = doc(dbClient, 'attendance_records', String(record.id));
-    await setDoc(ref, {
+    const payload = cleanForFirestore({
       ...record,
       _updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
+    await setDoc(ref, payload, { merge: true });
     handleOperationSuccess();
+    touchCloudDataUpdatedAt();
   } catch (err) {
     handleOperationError(err, 'syncRecordToFirestore');
   }
@@ -480,6 +747,7 @@ export async function deleteRecordFromFirestore(recordId: string): Promise<void>
     const ref = doc(dbClient, 'attendance_records', String(recordId));
     await deleteDoc(ref);
     handleOperationSuccess();
+    touchCloudDataUpdatedAt();
   } catch (err) {
     handleOperationError(err, 'deleteRecordFromFirestore');
   }
@@ -492,10 +760,11 @@ export async function syncSiteToFirestore(site: any): Promise<void> {
 
   try {
     const ref = doc(dbClient, 'sites', String(site.id));
-    await setDoc(ref, {
+    const payload = cleanForFirestore({
       ...site,
       _updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
+    await setDoc(ref, payload, { merge: true });
     handleOperationSuccess();
   } catch (err) {
     handleOperationError(err, 'syncSiteToFirestore');
@@ -523,10 +792,11 @@ export async function syncHolidayToFirestore(holiday: any): Promise<void> {
 
   try {
     const ref = doc(dbClient, 'holidays', String(holiday.fecha));
-    await setDoc(ref, {
+    const payload = cleanForFirestore({
       ...holiday,
       _updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
+    await setDoc(ref, payload, { merge: true });
     handleOperationSuccess();
   } catch (err) {
     handleOperationError(err, 'syncHolidayToFirestore');
@@ -554,10 +824,11 @@ export async function syncConfigToFirestore(key: string, value: any): Promise<vo
 
   try {
     const ref = doc(dbClient, 'system_config', 'main');
-    await setDoc(ref, {
+    const payload = cleanForFirestore({
       [key]: value,
       _updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
+    await setDoc(ref, payload, { merge: true });
     handleOperationSuccess();
   } catch (err) {
     handleOperationError(err, 'syncConfigToFirestore');

@@ -36,11 +36,15 @@ import {
   isFirestoreConfigured,
   syncAllToFirestore,
   pullFromFirestoreToCache,
+  reconcileStartupFromFirestore,
+  fetchStudentRecordsFromFirestore,
   getFirestoreDiagnostics,
   getFirestoreStatusInfo,
   syncStudentToFirestore,
+  syncMultipleStudentsToFirestore,
   deleteStudentFromFirestore,
   syncRecordToFirestore,
+  syncMultipleRecordsToFirestore,
   deleteRecordFromFirestore,
   syncSiteToFirestore,
   deleteSiteFromFirestore,
@@ -229,6 +233,7 @@ app.post('/api/upload-state', (req, res) => {
     persistDatabase(true);
     const snapshot = getAllDataSnapshot();
     broadcastChange('FULL_STATE_UPDATED', snapshot);
+    syncAllToFirestore().catch((err) => console.warn('Upload-state firestore sync notice:', err));
 
     res.json({
       success: true,
@@ -300,10 +305,13 @@ app.get('/api/students/:identifier', (req, res) => {
 app.post('/api/students', (req, res) => {
   const body = req.body;
   if (Array.isArray(body)) {
-    saveMultipleStudentsToDb(body);
+    const savedList = saveMultipleStudentsToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
-    return res.json({ success: true, students: updatedList });
+    syncMultipleStudentsToFirestore(savedList).catch((err) =>
+      console.warn('Students batch granular sync notice:', err)
+    );
+    return res.json({ success: true, count: savedList.length, students: updatedList });
   } else if (body && typeof body === 'object') {
     const saved = saveStudentToDb(body);
     const updatedList = getStudentsFromDb();
@@ -373,9 +381,7 @@ app.post('/api/students/unlink-all-devices', (_req, res) => {
   const count = unlinkAllDevicesInDb();
   const students = getStudentsFromDb();
   broadcastChange('STUDENTS_UPDATED', students);
-  students.forEach((st) => {
-    syncStudentToFirestore(st).catch((err) => console.warn('Unlink all granular sync notice:', err));
-  });
+  syncMultipleStudentsToFirestore(students).catch((err) => console.warn('Unlink all granular sync notice:', err));
   res.json({ success: true, unlinkedCount: count, totalStudents: students.length });
 });
 
@@ -454,21 +460,30 @@ app.post('/api/records/purge-old', (req, res) => {
   }
 });
 
-// Fast endpoint for students: downloads only their own records for current week/month
-app.get('/api/students/:identifier/records', (req, res) => {
+// Fast endpoint for students: downloads only their own records for current week/month, with optional cloud fetch for official reports
+app.get('/api/students/:identifier/records', async (req, res) => {
   const { identifier } = req.params;
-  const { startDate, endDate, limit } = req.query;
+  const { startDate, endDate, limit, fetchFromCloud } = req.query;
 
   const student = getStudentByMatriculaOrIdFromDb(identifier);
   if (!student) {
     return res.status(404).json({ success: false, message: 'Student not found' });
   }
 
+  // On demand: If requested (e.g. for generating individual reports or historical audit), fetch only this student's records from Firestore
+  if (fetchFromCloud === 'true' && isFirestoreConfigured()) {
+    try {
+      await fetchStudentRecordsFromFirestore(student.matricula);
+    } catch (err) {
+      console.warn('Notice fetching student cloud records:', err);
+    }
+  }
+
   const records = getRecordsFromDb({
     matricula: student.matricula,
     startDate: startDate ? String(startDate) : undefined,
     endDate: endDate ? String(endDate) : undefined,
-    limit: limit ? Number(limit) : 100,
+    limit: limit ? Number(limit) : 250,
   });
 
   res.json(records);
@@ -492,13 +507,16 @@ app.post('/api/records', (req, res) => {
   }
 
   if (Array.isArray(body)) {
+    const savedList: any[] = [];
     body.forEach((rec) => {
       if (rec && rec.id) {
-        saveRecordToDb(rec);
+        const s = saveRecordToDb(rec);
+        if (s) savedList.push(s);
       }
     });
     const all = getRecordsFromDb();
     broadcastChange('RECORDS_UPDATED', all);
+    syncMultipleRecordsToFirestore(savedList).catch((err) => console.warn('Records batch sync notice:', err));
     return res.json({ success: true, count: all.length, records: all });
   }
 
@@ -667,9 +685,22 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 ClinicasTrack Server running on http://0.0.0.0:${PORT}`);
-    console.log('⚡ Local-first SQLite & in-memory cache ready. Zero automatic reads/writes to Firestore on startup.');
+    if (isFirestoreConfigured()) {
+      try {
+        const checkRes = await reconcileStartupFromFirestore();
+        if (checkRes.success) {
+          console.log(`✅ ${checkRes.message}`);
+        } else {
+          console.warn('⚠️ Nota sobre reconciliación de arranque:', checkRes.message);
+        }
+      } catch (checkErr) {
+        console.warn('⚠️ Error no fatal al verificar Firestore en arranque:', checkErr);
+      }
+    } else {
+      console.log('⚡ Local-first SQLite & in-memory cache ready (Firestore no configurado).');
+    }
   });
 }
 
