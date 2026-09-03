@@ -1,7 +1,7 @@
 import initSqlJs, { Database } from 'sql.js';
 import fs from 'fs';
 import path from 'path';
-import { db as pgDb, isCloudSqlConfigured, markCloudSqlUnavailable } from '../db/index.ts';
+import { db as pgDb, isCloudSqlConfigured, isCloudSqlHealthy, markCloudSqlUnavailable } from '../db/index.ts';
 import {
   students as pgStudents,
   sites as pgSites,
@@ -9,23 +9,7 @@ import {
   systemConfig as pgSystemConfig,
   holidays as pgHolidays,
 } from '../db/schema.ts';
-import { eq, and, gte, lte, sql } from 'drizzle-orm';
-import {
-  syncStudentToFirestore,
-  syncMultipleStudentsToFirestore,
-  deleteStudentFromFirestore,
-  syncSiteToFirestore,
-  deleteSiteFromFirestore,
-  syncRecordToFirestore,
-  syncMultipleRecordsToFirestore,
-  deleteRecordFromFirestore,
-  syncHolidayToFirestore,
-  deleteHolidayFromFirestore,
-  syncConfigToFirestore,
-  syncAllToFirestore,
-  pullFromFirestoreToCache,
-  isFirestoreConfigured,
-} from './firestore.ts';
+import { eq, and, gte, lte, gt, sql, desc, asc } from 'drizzle-orm';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
@@ -37,6 +21,17 @@ let db: Database | null = null;
 let isSaving = false;
 let saveDebounceTimer: NodeJS.Timeout | null = null;
 let pgInitialized = false;
+let outboxIntervalTimer: NodeJS.Timeout | null = null;
+let isProcessingOutbox = false;
+
+// Helper to chunk arrays for batch database operations
+export function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
 
 // Creates an automatic timestamped backup of clinicas.db and app_state.json before restoring
 export function createAutoBackupBeforeRestore(): string | null {
@@ -94,159 +89,172 @@ async function syncToPostgreSql() {
 
     // Check existing count in postgres
     const existingStudents = await pgDb.select({ id: pgStudents.id }).from(pgStudents);
-    console.log(`📊 Cloud SQL current students count: ${existingStudents.length}, local students count: ${snapshot.students.length}`);
+    console.log(`📊 PostgreSQL / Supabase current students count: ${existingStudents.length}, local students count: ${snapshot.students.length}`);
 
-    if (existingStudents.length === 0 && snapshot.students.length > 0) {
-      console.log('🚀 Migrating initial student catalog to Cloud SQL PostgreSQL...');
-      for (const st of snapshot.students) {
-        if (!st || !st.matricula) continue;
-        try {
-          await pgDb
-            .insert(pgStudents)
-            .values({
-              id: st.id || `std-${st.matricula}`,
-              matricula: String(st.matricula).trim(),
-              nombre: st.nombre || '',
-              email: st.email || '',
-              especialidad: st.especialidad || st.rotacion || 'Urgencias Médicas',
-              rotacion: st.rotacion || st.especialidad || 'Urgencias Médicas',
-              grupo: st.grupo || '10 A',
-              equipo: st.equipo || 'Equipo 1',
-              activo: st.activo !== false ? 1 : 0,
-              sedeId: st.sedeId || 'site-1',
-              sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
-              secondarySedeId: st.secondarySedeId || null,
-              secondarySedeNombre: st.secondarySedeNombre || null,
-              horaEntrada: st.horaEntrada || '07:00',
-              horaSalida: st.horaSalida || '15:00',
-              toleranciaMinutos: st.toleranciaMinutos || 15,
-              diasAsistencia: JSON.stringify(st.diasAsistencia || []),
-              horariosPorDia: JSON.stringify(st.horariosPorDia || []),
-              linkedDeviceId: st.linkedDeviceId || null,
-              linkedDeviceName: st.linkedDeviceName || null,
-              linkedAt: st.linkedAt || null,
-              dataJson: JSON.stringify(st),
-              updatedAt: st.updatedAt || new Date().toISOString(),
-            })
-            .onConflictDoUpdate({
-              target: pgStudents.matricula,
-              set: {
-                nombre: st.nombre || '',
-                email: st.email || '',
-                especialidad: st.especialidad || st.rotacion || 'Urgencias Médicas',
-                rotacion: st.rotacion || st.especialidad || 'Urgencias Médicas',
-                grupo: st.grupo || '10 A',
-                equipo: st.equipo || 'Equipo 1',
-                activo: st.activo !== false ? 1 : 0,
-                sedeId: st.sedeId || 'site-1',
-                sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
-                secondarySedeId: st.secondarySedeId || null,
-                secondarySedeNombre: st.secondarySedeNombre || null,
-                horaEntrada: st.horaEntrada || '07:00',
-                horaSalida: st.horaSalida || '15:00',
-                toleranciaMinutos: st.toleranciaMinutos || 15,
-                diasAsistencia: JSON.stringify(st.diasAsistencia || []),
-                horariosPorDia: JSON.stringify(st.horariosPorDia || []),
-                linkedDeviceId: st.linkedDeviceId || null,
-                linkedDeviceName: st.linkedDeviceName || null,
-                linkedAt: st.linkedAt || null,
-                dataJson: JSON.stringify(st),
-                updatedAt: st.updatedAt || new Date().toISOString(),
-              },
-            });
-        } catch (stErr) {
-          console.warn(`Warning inserting student ${st.matricula} to Cloud SQL:`, stErr);
+    // 1. Run Delta Sync first: updates any students or sites modified in Supabase, and recent records
+    await performDeltaSyncFromSupabase({ attendanceDaysBack: 7 });
+
+    // 2. Initial push to Supabase if Supabase is brand new / has fewer students than local seed
+    if (existingStudents.length < snapshot.students.length && snapshot.students.length > 0) {
+      console.log(`🚀 Migrating student catalog to PostgreSQL / Supabase in batches (${snapshot.students.length} students)...`);
+      const studentChunks = chunkArray(snapshot.students.filter((st) => st && st.matricula), 100);
+      for (const chunk of studentChunks) {
+        const rows = chunk.map((st) => ({
+          id: st.id || `std-${st.matricula}`,
+          matricula: String(st.matricula).trim(),
+          nombre: st.nombre || '',
+          email: st.email || '',
+          especialidad: st.especialidad || st.rotacion || 'Urgencias Médicas',
+          rotacion: st.rotacion || st.especialidad || 'Urgencias Médicas',
+          grupo: st.grupo || '10 A',
+          equipo: st.equipo || 'Equipo 1',
+          activo: st.activo !== false ? 1 : 0,
+          sedeId: st.sedeId || 'site-1',
+          sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+          secondarySedeId: st.secondarySedeId || null,
+          secondarySedeNombre: st.secondarySedeNombre || null,
+          horaEntrada: st.horaEntrada || '07:00',
+          horaSalida: st.horaSalida || '15:00',
+          toleranciaMinutos: Number(st.toleranciaMinutos) || 15,
+          diasAsistencia: JSON.stringify(st.diasAsistencia || []),
+          horariosPorDia: JSON.stringify(st.horariosPorDia || []),
+          linkedDeviceId: st.linkedDeviceId || null,
+          linkedDeviceName: st.linkedDeviceName || null,
+          linkedAt: st.linkedAt || null,
+          dataJson: JSON.stringify(st),
+          updatedAt: st.updatedAt || new Date().toISOString(),
+        }));
+        if (rows.length > 0) {
+          try {
+            await pgDb
+              .insert(pgStudents)
+              .values(rows)
+              .onConflictDoUpdate({
+                target: pgStudents.matricula,
+                set: {
+                  nombre: sql`excluded.nombre`,
+                  email: sql`excluded.email`,
+                  especialidad: sql`excluded.especialidad`,
+                  rotacion: sql`excluded.rotacion`,
+                  grupo: sql`excluded.grupo`,
+                  equipo: sql`excluded.equipo`,
+                  activo: sql`excluded.activo`,
+                  sedeId: sql`excluded.sede_id`,
+                  sedeNombre: sql`excluded.sede_nombre`,
+                  secondarySedeId: sql`excluded.secondary_sede_id`,
+                  secondarySedeNombre: sql`excluded.secondary_sede_nombre`,
+                  horaEntrada: sql`excluded.hora_entrada`,
+                  horaSalida: sql`excluded.hora_salida`,
+                  toleranciaMinutos: sql`excluded.tolerancia_minutos`,
+                  diasAsistencia: sql`excluded.dias_asistencia`,
+                  horariosPorDia: sql`excluded.horarios_por_dia`,
+                  linkedDeviceId: sql`excluded.linked_device_id`,
+                  linkedDeviceName: sql`excluded.linked_device_name`,
+                  linkedAt: sql`excluded.linked_at`,
+                  dataJson: sql`excluded.data_json`,
+                  updatedAt: sql`excluded.updated_at`,
+                },
+              });
+          } catch (stErr) {
+            console.warn('Warning batch inserting students to PostgreSQL:', stErr);
+          }
         }
       }
-      console.log('✅ Students migrated to Cloud SQL PostgreSQL.');
+      console.log('✅ Students synchronized to PostgreSQL / Supabase.');
     }
 
-    // Sync Sites
+
+    // Sync Sites (in batch)
     if (snapshot.sites.length > 0) {
-      for (const s of snapshot.sites) {
-        if (!s || !s.id) continue;
+      const siteRows = snapshot.sites.filter((s) => s && s.id).map((s) => ({
+        id: s.id,
+        nombre: s.nombre || '',
+        direccion: s.direccion || '',
+        latitude: Number(s.latitude) || 0,
+        longitude: Number(s.longitude) || 0,
+        radiusMeters: Number(s.radiusMeters) || 150,
+        horaEntrada: s.horaEntrada || '07:00',
+        horaSalida: s.horaSalida || '15:00',
+        toleranciaMinutos: Number(s.toleranciaMinutos) || 15,
+        dataJson: JSON.stringify(s),
+        updatedAt: s.updatedAt || new Date().toISOString(),
+      }));
+      if (siteRows.length > 0) {
         try {
           await pgDb
             .insert(pgSites)
-            .values({
-              id: s.id,
-              nombre: s.nombre || '',
-              direccion: s.direccion || '',
-              latitude: Number(s.latitude) || 0,
-              longitude: Number(s.longitude) || 0,
-              radiusMeters: Number(s.radiusMeters) || 150,
-              horaEntrada: s.horaEntrada || '07:00',
-              horaSalida: s.horaSalida || '15:00',
-              toleranciaMinutos: Number(s.toleranciaMinutos) || 15,
-              dataJson: JSON.stringify(s),
-              updatedAt: s.updatedAt || new Date().toISOString(),
-            })
+            .values(siteRows)
             .onConflictDoUpdate({
               target: pgSites.id,
               set: {
-                nombre: s.nombre || '',
-                direccion: s.direccion || '',
-                latitude: Number(s.latitude) || 0,
-                longitude: Number(s.longitude) || 0,
-                radiusMeters: Number(s.radiusMeters) || 150,
-                horaEntrada: s.horaEntrada || '07:00',
-                horaSalida: s.horaSalida || '15:00',
-                toleranciaMinutos: Number(s.toleranciaMinutos) || 15,
-                dataJson: JSON.stringify(s),
-                updatedAt: s.updatedAt || new Date().toISOString(),
+                nombre: sql`excluded.nombre`,
+                direccion: sql`excluded.direccion`,
+                latitude: sql`excluded.latitude`,
+                longitude: sql`excluded.longitude`,
+                radiusMeters: sql`excluded.radius_meters`,
+                horaEntrada: sql`excluded.hora_entrada`,
+                horaSalida: sql`excluded.hora_salida`,
+                toleranciaMinutos: sql`excluded.tolerancia_minutos`,
+                dataJson: sql`excluded.data_json`,
+                updatedAt: sql`excluded.updated_at`,
               },
             });
         } catch (siteErr) {
-          console.warn(`Warning inserting site ${s.id} to Cloud SQL:`, siteErr);
+          console.warn('Warning inserting sites batch to Supabase:', siteErr);
         }
       }
     }
 
-    // Sync Attendance Records
+    // Sync Attendance Records (in batches of 150)
     const existingRecords = await pgDb.select({ id: pgAttendanceRecords.id }).from(pgAttendanceRecords);
-    if (existingRecords.length === 0 && snapshot.records.length > 0) {
-      console.log(`🚀 Migrating ${snapshot.records.length} historical attendance records to Cloud SQL PostgreSQL...`);
-      for (const r of snapshot.records) {
-        if (!r || !r.id) continue;
-        try {
+    if (existingRecords.length < snapshot.records.length && snapshot.records.length > 0) {
+      console.log(`🚀 Migrating ${snapshot.records.length} historical attendance records to Cloud SQL PostgreSQL in batches...`);
+      const recordChunks = chunkArray(snapshot.records.filter((r) => r && r.id), 150);
+      for (const chunk of recordChunks) {
+        const rows = chunk.map((r) => {
           const resolvedEstado = (r.esJustificada || r.checkInStatus === 'JUSTIFICADA' || r.estado === 'JUSTIFICADA')
             ? 'JUSTIFICADA'
             : (r.checkInStatus || r.estado || 'A_TIEMPO');
+          return {
+            id: r.id,
+            studentId: r.studentId || '',
+            matricula: r.matricula ? String(r.matricula).trim() : '',
+            studentNombre: r.studentNombre || '',
+            grupo: r.grupo || '',
+            equipo: r.equipo || '',
+            siteId: r.siteId || '',
+            siteNombre: r.siteNombre || '',
+            fecha: r.fecha || '',
+            tipo: r.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
+            horaRegistrada: r.horaRegistrada || '',
+            estado: resolvedEstado,
+            horaEsperada: r.horaEsperada || '',
+            toleranciaMinutos: Number(r.toleranciaMinutos) || 15,
+            minutosDiferencia: Number(r.minutosDiferencia) || 0,
+            latitude: Number(r.latitude) || 0,
+            longitude: Number(r.longitude) || 0,
+            distanceMeters: Number(r.distanceMeters) || 0,
+            accuracyMeters: Number(r.accuracyMeters) || 0,
+            dentroDeZona: r.dentroDeZona ? 1 : 0,
+            deviceId: r.deviceId || '',
+            deviceName: r.deviceName || '',
+            verificadoPorGPS: r.verificadoPorGPS ? 1 : 0,
+            esJustificada: (r.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
+            motivoJustificante: r.motivoJustificante || '',
+            dataJson: JSON.stringify(r),
+            createdAt: r.fecha || new Date().toISOString(),
+          };
+        });
 
-          await pgDb
-            .insert(pgAttendanceRecords)
-            .values({
-              id: r.id,
-              studentId: r.studentId || '',
-              matricula: r.matricula ? String(r.matricula).trim() : '',
-              studentNombre: r.studentNombre || '',
-              grupo: r.grupo || '',
-              equipo: r.equipo || '',
-              siteId: r.siteId || '',
-              siteNombre: r.siteNombre || '',
-              fecha: r.fecha || '',
-              tipo: r.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
-              horaRegistrada: r.horaRegistrada || '',
-              estado: resolvedEstado,
-              horaEsperada: r.horaEsperada || '',
-              toleranciaMinutos: Number(r.toleranciaMinutos) || 15,
-              minutosDiferencia: Number(r.minutosDiferencia) || 0,
-              latitude: Number(r.latitude) || 0,
-              longitude: Number(r.longitude) || 0,
-              distanceMeters: Number(r.distanceMeters) || 0,
-              accuracyMeters: Number(r.accuracyMeters) || 0,
-              dentroDeZona: r.dentroDeZona ? 1 : 0,
-              deviceId: r.deviceId || '',
-              deviceName: r.deviceName || '',
-              verificadoPorGPS: r.verificadoPorGPS ? 1 : 0,
-              esJustificada: (r.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
-              motivoJustificante: r.motivoJustificante || '',
-              dataJson: JSON.stringify(r),
-              createdAt: r.fecha || new Date().toISOString(),
-            })
-            .onConflictDoNothing();
-        } catch (recErr) {
-          console.warn(`Warning inserting record ${r.id} to Cloud SQL:`, recErr);
+        if (rows.length > 0) {
+          try {
+            await pgDb
+              .insert(pgAttendanceRecords)
+              .values(rows)
+              .onConflictDoNothing();
+          } catch (recErr) {
+            console.warn('Warning batch inserting records to Supabase:', recErr);
+          }
         }
       }
       console.log('✅ Attendance records migrated to Cloud SQL PostgreSQL.');
@@ -286,6 +294,9 @@ async function syncToPostgreSql() {
           },
         });
     }
+
+    // Process any pending retry items from the outbox
+    await processPendingCloudSyncQueue();
 
     pgInitialized = true;
     console.log('🌟 Cloud SQL PostgreSQL synchronization verified successfully.');
@@ -416,11 +427,23 @@ export async function initDatabase(): Promise<Database> {
       fechaCreacion TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS pending_cloud_sync (
+      id TEXT PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_students_matricula ON students(matricula);
     CREATE INDEX IF NOT EXISTS idx_records_student_fecha ON attendance_records(matricula, fecha);
     CREATE INDEX IF NOT EXISTS idx_records_fecha ON attendance_records(fecha);
     CREATE INDEX IF NOT EXISTS idx_records_estado ON attendance_records(estado);
     CREATE INDEX IF NOT EXISTS idx_records_grupo ON attendance_records(grupo);
+    CREATE INDEX IF NOT EXISTS idx_pending_cloud_sync_type ON pending_cloud_sync(entity_type);
   `;
 
   try {
@@ -435,6 +458,23 @@ export async function initDatabase(): Promise<Database> {
     loadedFromDb = false;
   }
 
+  // Ensure pending_cloud_sync table exists even if loaded from an existing clinicas.db
+  try {
+    db.run(`
+      CREATE TABLE IF NOT EXISTS pending_cloud_sync (
+        id TEXT PRIMARY KEY,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_cloud_sync_type ON pending_cloud_sync(entity_type);
+    `);
+  } catch {}
+
   if (!loadedFromDb) {
     loadDataFromSnapshots();
     flushDatabaseToDisk();
@@ -447,6 +487,15 @@ export async function initDatabase(): Promise<Database> {
     syncToPostgreSql().catch((err) => {
       console.warn('⚠️ Cloud SQL background synchronization note:', err);
     });
+  }
+
+  // Start background Outbox retry timer (runs every 60 seconds)
+  if (!outboxIntervalTimer) {
+    outboxIntervalTimer = setInterval(() => {
+      processPendingCloudSyncQueue().catch((err) => {
+        console.warn('⚠️ [Outbox Worker] Periodic synchronization note:', err?.message || err);
+      });
+    }, 60000);
   }
 
   return db;
@@ -513,13 +562,299 @@ function flushDatabaseToDisk() {
   }
 }
 
-// Immediate database persistence
-export function persistDatabase(_immediate = true) {
-  if (saveDebounceTimer) {
-    clearTimeout(saveDebounceTimer);
-    saveDebounceTimer = null;
+// Database persistence with 500ms debounce to protect container disk I/O from rapid bursts
+export function persistDatabase(immediate = false) {
+  if (immediate) {
+    if (saveDebounceTimer) {
+      clearTimeout(saveDebounceTimer);
+      saveDebounceTimer = null;
+    }
+    flushDatabaseToDisk();
+    return;
   }
-  flushDatabaseToDisk();
+
+  // If already scheduled, let the pending debounce handle the batch flush
+  if (!saveDebounceTimer) {
+    saveDebounceTimer = setTimeout(() => {
+      saveDebounceTimer = null;
+      flushDatabaseToDisk();
+    }, 500);
+  }
+}
+
+// ----------------- OUTBOX PATTERN (PENDING CLOUD SYNC) -----------------
+
+export function enqueuePendingCloudSync(
+  entityType: 'record' | 'delete_record' | 'student' | 'delete_student' | 'site',
+  entityId: string,
+  payload: any,
+  errorMsg?: string
+) {
+  if (!db) return;
+  try {
+    const id = `${entityType}_${entityId}`;
+    const now = new Date().toISOString();
+    const stmt = db.prepare(`
+      INSERT INTO pending_cloud_sync (id, entity_type, entity_id, payload_json, attempts, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        payload_json = excluded.payload_json,
+        attempts = pending_cloud_sync.attempts + 1,
+        last_error = excluded.last_error,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run([id, entityType, entityId, JSON.stringify(payload), errorMsg || null, now, now]);
+    stmt.free();
+    persistDatabase(false);
+  } catch (err) {
+    console.warn('⚠️ Error enqueuing item to pending_cloud_sync:', err);
+  }
+}
+
+export function dequeuePendingCloudSync(entityType: string, entityId: string) {
+  if (!db) return;
+  try {
+    const id = `${entityType}_${entityId}`;
+    const stmt = db.prepare(`DELETE FROM pending_cloud_sync WHERE id = ?`);
+    stmt.run([id]);
+    stmt.free();
+  } catch {}
+}
+
+export function getPendingCloudSyncCount(): number {
+  if (!db) return 0;
+  try {
+    const res = db.exec(`SELECT count(*) FROM pending_cloud_sync`);
+    if (res.length > 0 && res[0].values.length > 0) {
+      return Number(res[0].values[0][0]) || 0;
+    }
+  } catch {}
+  return 0;
+}
+
+export async function processPendingCloudSyncQueue(): Promise<{
+  processed: number;
+  succeeded: number;
+  failed: number;
+  remaining: number;
+}> {
+  if (!db || !isCloudSqlConfigured() || !pgDb || !isCloudSqlHealthy() || isProcessingOutbox) {
+    return { processed: 0, succeeded: 0, failed: 0, remaining: getPendingCloudSyncCount() };
+  }
+
+  const initialCount = getPendingCloudSyncCount();
+  if (initialCount === 0) {
+    return { processed: 0, succeeded: 0, failed: 0, remaining: 0 };
+  }
+
+  isProcessingOutbox = true;
+  let succeeded = 0;
+  let failed = 0;
+
+  try {
+    const stmt = db.prepare(`
+      SELECT id, entity_type, entity_id, payload_json, attempts
+      FROM pending_cloud_sync
+      ORDER BY created_at ASC
+      LIMIT 200
+    `);
+    const items: Array<{ id: string; entity_type: string; entity_id: string; payload_json: string; attempts: number }> = [];
+    while (stmt.step()) {
+      const row = stmt.get();
+      items.push({
+        id: String(row[0]),
+        entity_type: String(row[1]),
+        entity_id: String(row[2]),
+        payload_json: String(row[3]),
+        attempts: Number(row[4] || 0),
+      });
+    }
+    stmt.free();
+
+    if (items.length === 0) {
+      isProcessingOutbox = false;
+      return { processed: 0, succeeded: 0, failed: 0, remaining: 0 };
+    }
+
+    console.log(`📤 [Outbox Worker] Retrying ${items.length} pending operations to Supabase PostgreSQL...`);
+
+    const recordsToUpsert: any[] = [];
+    const recordsToDelete: string[] = [];
+    const studentsToUpsert: any[] = [];
+    const studentsToDelete: string[] = [];
+
+    for (const item of items) {
+      try {
+        const payload = JSON.parse(item.payload_json);
+        if (item.entity_type === 'record') recordsToUpsert.push({ item, payload });
+        else if (item.entity_type === 'delete_record') recordsToDelete.push(item.entity_id);
+        else if (item.entity_type === 'student') studentsToUpsert.push({ item, payload });
+        else if (item.entity_type === 'delete_student') studentsToDelete.push(item.entity_id);
+      } catch {
+        dequeuePendingCloudSync(item.entity_type, item.entity_id);
+      }
+    }
+
+    // Process attendance records in batches of 100
+    if (recordsToUpsert.length > 0) {
+      const chunks = chunkArray(recordsToUpsert, 100);
+      for (const chunk of chunks) {
+        const rows = chunk.map(({ payload }) => {
+          const resolvedEstado =
+            payload.esJustificada || payload.checkInStatus === 'JUSTIFICADA' || payload.estado === 'JUSTIFICADA'
+              ? 'JUSTIFICADA'
+              : (payload.checkInStatus || payload.estado || 'A_TIEMPO');
+          return {
+            id: payload.id,
+            studentId: payload.studentId || '',
+            matricula: payload.matricula ? String(payload.matricula).trim() : '',
+            studentNombre: payload.studentNombre || '',
+            grupo: payload.grupo || '',
+            equipo: payload.equipo || '',
+            siteId: payload.siteId || '',
+            siteNombre: payload.siteNombre || '',
+            fecha: payload.fecha || '',
+            tipo: payload.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
+            horaRegistrada: payload.horaRegistrada || '',
+            estado: resolvedEstado,
+            horaEsperada: payload.horaEsperada || '',
+            toleranciaMinutos: Number(payload.toleranciaMinutos) || 15,
+            minutosDiferencia: Number(payload.minutosDiferencia) || 0,
+            latitude: Number(payload.latitude) || 0,
+            longitude: Number(payload.longitude) || 0,
+            distanceMeters: Number(payload.distanceMeters) || 0,
+            accuracyMeters: Number(payload.accuracyMeters) || 0,
+            dentroDeZona: payload.dentroDeZona ? 1 : 0,
+            deviceId: payload.deviceId || '',
+            deviceName: payload.deviceName || '',
+            verificadoPorGPS: payload.verificadoPorGPS ? 1 : 0,
+            esJustificada: (payload.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
+            motivoJustificante: payload.motivoJustificante || '',
+            dataJson: JSON.stringify(payload),
+            createdAt: payload.fecha || new Date().toISOString(),
+          };
+        });
+
+        try {
+          await pgDb
+            .insert(pgAttendanceRecords)
+            .values(rows)
+            .onConflictDoUpdate({
+              target: pgAttendanceRecords.id,
+              set: {
+                horaRegistrada: sql`excluded.hora_registrada`,
+                estado: sql`excluded.estado`,
+                esJustificada: sql`excluded.es_justificada`,
+                motivoJustificante: sql`excluded.motivo_justificante`,
+                dataJson: sql`excluded.data_json`,
+              },
+            });
+          for (const { item } of chunk) {
+            dequeuePendingCloudSync(item.entity_type, item.entity_id);
+            succeeded++;
+          }
+        } catch (err: any) {
+          console.warn('⚠️ Outbox error pushing records chunk to Supabase:', err?.message || err);
+          markCloudSqlUnavailable(err);
+          failed += chunk.length;
+          break;
+        }
+      }
+    }
+
+    // Process record deletions
+    for (const recId of recordsToDelete) {
+      try {
+        await pgDb.delete(pgAttendanceRecords).where(eq(pgAttendanceRecords.id, recId));
+        dequeuePendingCloudSync('delete_record', recId);
+        succeeded++;
+      } catch (err: any) {
+        failed++;
+      }
+    }
+
+    // Process students in batches of 100
+    if (studentsToUpsert.length > 0) {
+      const studentChunks = chunkArray(studentsToUpsert, 100);
+      for (const chunk of studentChunks) {
+        const rows = chunk.map(({ payload: st }) => ({
+          id: st.id || `std-${st.matricula}`,
+          matricula: String(st.matricula).trim(),
+          nombre: st.nombre || '',
+          email: st.email || '',
+          especialidad: st.especialidad || st.rotacion || 'Urgencias Médicas',
+          rotacion: st.rotacion || st.especialidad || 'Urgencias Médicas',
+          grupo: st.grupo || '10 A',
+          equipo: st.equipo || 'Equipo 1',
+          activo: st.activo !== false ? 1 : 0,
+          sedeId: st.sedeId || 'site-1',
+          sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+          secondarySedeId: st.secondarySedeId || null,
+          secondarySedeNombre: st.secondarySedeNombre || null,
+          horaEntrada: st.horaEntrada || '07:00',
+          horaSalida: st.horaSalida || '15:00',
+          toleranciaMinutos: Number(st.toleranciaMinutos) || 15,
+          diasAsistencia: JSON.stringify(st.diasAsistencia || []),
+          horariosPorDia: JSON.stringify(st.horariosPorDia || []),
+          linkedDeviceId: st.linkedDeviceId || null,
+          linkedDeviceName: st.linkedDeviceName || null,
+          linkedAt: st.linkedAt || null,
+          dataJson: JSON.stringify(st),
+          updatedAt: st.updatedAt || new Date().toISOString(),
+        }));
+
+        try {
+          await pgDb
+            .insert(pgStudents)
+            .values(rows)
+            .onConflictDoUpdate({
+              target: pgStudents.matricula,
+              set: {
+                nombre: sql`excluded.nombre`,
+                email: sql`excluded.email`,
+                especialidad: sql`excluded.especialidad`,
+                rotacion: sql`excluded.rotacion`,
+                grupo: sql`excluded.grupo`,
+                equipo: sql`excluded.equipo`,
+                activo: sql`excluded.activo`,
+                sedeId: sql`excluded.sede_id`,
+                sedeNombre: sql`excluded.sede_nombre`,
+                secondarySedeId: sql`excluded.secondary_sede_id`,
+                secondarySedeNombre: sql`excluded.secondary_sede_nombre`,
+                horaEntrada: sql`excluded.hora_entrada`,
+                horaSalida: sql`excluded.hora_salida`,
+                toleranciaMinutos: sql`excluded.tolerancia_minutos`,
+                diasAsistencia: sql`excluded.dias_asistencia`,
+                horariosPorDia: sql`excluded.horarios_por_dia`,
+                linkedDeviceId: sql`excluded.linked_device_id`,
+                linkedDeviceName: sql`excluded.linked_device_name`,
+                linkedAt: sql`excluded.linked_at`,
+                dataJson: sql`excluded.data_json`,
+                updatedAt: sql`excluded.updated_at`,
+              },
+            });
+          for (const { item } of chunk) {
+            dequeuePendingCloudSync(item.entity_type, item.entity_id);
+            succeeded++;
+          }
+        } catch (err: any) {
+          failed += chunk.length;
+          break;
+        }
+      }
+    }
+
+    if (succeeded > 0) {
+      console.log(`✅ [Outbox Worker] Synced ${succeeded} pending operations to Supabase successfully.`);
+    }
+  } catch (err) {
+    console.warn('⚠️ [Outbox Worker] Error in worker execution:', err);
+  } finally {
+    isProcessingOutbox = false;
+  }
+
+  const remaining = getPendingCloudSyncCount();
+  return { processed: succeeded + failed, succeeded, failed, remaining };
 }
 
 // Helper for safe rollback that prevents 'cannot rollback - no transaction is active'
@@ -1097,7 +1432,6 @@ export function getSystemConfig(key: string, defaultValue: any = null): any {
 export function setSystemConfig(key: string, value: any) {
   setSystemConfigInternal(key, value);
   persistDatabase();
-  syncConfigToFirestore(key, value).catch(() => {});
 }
 
 // ----------------- CRUD Operations -----------------
@@ -1151,7 +1485,7 @@ export function getSitesFromDb(): any[] {
   return res[0].values.map((v) => JSON.parse(v[0] as string));
 }
 
-export function saveSiteToDb(site: any) {
+export function saveSiteToDb(site: any, persist = true, syncRemote = true) {
   if (!db || !site || !site.id) return;
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO sites (id, nombre, direccion, latitude, longitude, radiusMeters, horaEntrada, horaSalida, toleranciaMinutos, data_json, updated_at)
@@ -1171,9 +1505,11 @@ export function saveSiteToDb(site: any) {
     site.updatedAt || new Date().toISOString(),
   ]);
   stmt.free();
-  persistDatabase();
+  if (persist) {
+    persistDatabase();
+  }
 
-  if (isCloudSqlConfigured() && pgDb) {
+  if (syncRemote && isCloudSqlConfigured() && pgDb) {
     pgDb
       .insert(pgSites)
       .values({
@@ -1206,8 +1542,6 @@ export function saveSiteToDb(site: any) {
       })
       .catch((err) => markCloudSqlUnavailable(err));
   }
-
-  syncSiteToFirestore(site).catch(() => {});
 }
 
 export function deleteSiteFromDb(siteId: string): boolean {
@@ -1224,7 +1558,6 @@ export function deleteSiteFromDb(siteId: string): boolean {
       .catch((err) => markCloudSqlUnavailable(err));
   }
 
-  deleteSiteFromFirestore(siteId).catch(() => {});
   return true;
 }
 
@@ -1253,7 +1586,7 @@ export function getStudentByMatriculaOrIdFromDb(identifier: string): any | null 
   return null;
 }
 
-export function saveStudentToDb(student: any, persist = true, syncFirestore = true): any {
+export function saveStudentToDb(student: any, persist = true, syncRemote = true): any {
   if (!db || !student) return null;
   const matricula = String(student.matricula || '').trim();
   if (!matricula) return null;
@@ -1388,10 +1721,6 @@ export function saveStudentToDb(student: any, persist = true, syncFirestore = tr
       .catch((err) => markCloudSqlUnavailable(err));
   }
 
-  if (syncFirestore) {
-    syncStudentToFirestore(fullStudent).catch(() => {});
-  }
-
   return fullStudent;
 }
 
@@ -1415,7 +1744,6 @@ export function saveMultipleStudentsToDb(studentsList: any[]): any[] {
     console.error('Error saving batch students to SQLite:', err);
   }
   persistDatabase();
-  syncMultipleStudentsToFirestore(results).catch((err) => console.warn('Batch students sync notice:', err));
   return results;
 }
 
@@ -1433,8 +1761,6 @@ export function deleteStudentFromDb(studentId: string): boolean {
       .where(eq(pgStudents.matricula, clean))
       .catch((err) => console.warn('PostgreSQL deleteStudent notice:', err));
   }
-
-  deleteStudentFromFirestore(clean).catch(() => {});
 
   return true;
 }
@@ -1668,7 +1994,7 @@ export function getRecordsPaginatedFromDb(params: RecordQueryParams & { page?: n
 export function purgeOldAttendanceRecords(options?: {
   daysToKeep?: number;
   beforeDate?: string;
-  deleteFromFirestore?: boolean;
+  deleteFromCloud?: boolean;
 }): {
   deletedCount: number;
   cutoffDate: string;
@@ -1805,7 +2131,7 @@ export function getAttendanceStatsFromDb(startDate?: string, endDate?: string, g
   };
 }
 
-export function saveRecordToDb(record: any): any {
+export function saveRecordToDb(record: any, syncRemote = true): any {
   if (!db || !record || !record.id) return null;
   const resolvedEstado = (record.esJustificada || record.checkInStatus === 'JUSTIFICADA' || record.estado === 'JUSTIFICADA')
     ? 'JUSTIFICADA'
@@ -1852,54 +2178,62 @@ export function saveRecordToDb(record: any): any {
   ]);
   stmt.free();
 
-  persistDatabase(true);
+  persistDatabase(false);
 
-  if (isCloudSqlConfigured() && pgDb) {
-    pgDb
-      .insert(pgAttendanceRecords)
-      .values({
-        id: record.id,
-        studentId: record.studentId || '',
-        matricula: record.matricula ? String(record.matricula).trim() : '',
-        studentNombre: record.studentNombre || '',
-        grupo: record.grupo || '',
-        equipo: record.equipo || '',
-        siteId: record.siteId || '',
-        siteNombre: record.siteNombre || '',
-        fecha: record.fecha || '',
-        tipo: record.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
-        horaRegistrada: record.horaRegistrada || '',
-        estado: resolvedEstado,
-        horaEsperada: record.horaEsperada || '',
-        toleranciaMinutos: Number(record.toleranciaMinutos) || 15,
-        minutosDiferencia: Number(record.minutosDiferencia) || 0,
-        latitude: Number(record.latitude) || 0,
-        longitude: Number(record.longitude) || 0,
-        distanceMeters: Number(record.distanceMeters) || 0,
-        accuracyMeters: Number(record.accuracyMeters) || 0,
-        dentroDeZona: record.dentroDeZona ? 1 : 0,
-        deviceId: record.deviceId || '',
-        deviceName: record.deviceName || '',
-        verificadoPorGPS: record.verificadoPorGPS ? 1 : 0,
-        esJustificada: (record.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
-        motivoJustificante: record.motivoJustificante || '',
-        dataJson: JSON.stringify(record),
-        createdAt: record.fecha || new Date().toISOString(),
-      })
-      .onConflictDoUpdate({
-        target: pgAttendanceRecords.id,
-        set: {
+  if (syncRemote) {
+    if (isCloudSqlConfigured() && pgDb && isCloudSqlHealthy()) {
+      pgDb
+        .insert(pgAttendanceRecords)
+        .values({
+          id: record.id,
+          studentId: record.studentId || '',
+          matricula: record.matricula ? String(record.matricula).trim() : '',
+          studentNombre: record.studentNombre || '',
+          grupo: record.grupo || '',
+          equipo: record.equipo || '',
+          siteId: record.siteId || '',
+          siteNombre: record.siteNombre || '',
+          fecha: record.fecha || '',
+          tipo: record.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
           horaRegistrada: record.horaRegistrada || '',
           estado: resolvedEstado,
+          horaEsperada: record.horaEsperada || '',
+          toleranciaMinutos: Number(record.toleranciaMinutos) || 15,
+          minutosDiferencia: Number(record.minutosDiferencia) || 0,
+          latitude: Number(record.latitude) || 0,
+          longitude: Number(record.longitude) || 0,
+          distanceMeters: Number(record.distanceMeters) || 0,
+          accuracyMeters: Number(record.accuracyMeters) || 0,
+          dentroDeZona: record.dentroDeZona ? 1 : 0,
+          deviceId: record.deviceId || '',
+          deviceName: record.deviceName || '',
+          verificadoPorGPS: record.verificadoPorGPS ? 1 : 0,
           esJustificada: (record.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
           motivoJustificante: record.motivoJustificante || '',
           dataJson: JSON.stringify(record),
-        },
-      })
-      .catch((err) => markCloudSqlUnavailable(err));
+          createdAt: record.fecha || new Date().toISOString(),
+        })
+        .onConflictDoUpdate({
+          target: pgAttendanceRecords.id,
+          set: {
+            horaRegistrada: record.horaRegistrada || '',
+            estado: resolvedEstado,
+            esJustificada: (record.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
+            motivoJustificante: record.motivoJustificante || '',
+            dataJson: JSON.stringify(record),
+          },
+        })
+        .then(() => {
+          dequeuePendingCloudSync('record', record.id);
+        })
+        .catch((err) => {
+          markCloudSqlUnavailable(err);
+          enqueuePendingCloudSync('record', record.id, record, err?.message);
+        });
+    } else {
+      enqueuePendingCloudSync('record', record.id, record, 'Supabase offline o en enfriamiento');
+    }
   }
-
-  syncRecordToFirestore(record).catch(() => {});
 
   return record;
 }
@@ -1909,16 +2243,20 @@ export function deleteRecordFromDb(recordId: string): boolean {
   const stmt = db.prepare(`DELETE FROM attendance_records WHERE id = ?`);
   stmt.run([recordId]);
   stmt.free();
-  persistDatabase();
+  persistDatabase(false);
 
-  if (isCloudSqlConfigured() && pgDb) {
+  if (isCloudSqlConfigured() && pgDb && isCloudSqlHealthy()) {
     pgDb
       .delete(pgAttendanceRecords)
       .where(eq(pgAttendanceRecords.id, recordId))
-      .catch((err) => markCloudSqlUnavailable(err));
+      .then(() => dequeuePendingCloudSync('delete_record', recordId))
+      .catch((err) => {
+        markCloudSqlUnavailable(err);
+        enqueuePendingCloudSync('delete_record', recordId, { id: recordId }, err?.message);
+      });
+  } else {
+    enqueuePendingCloudSync('delete_record', recordId, { id: recordId }, 'Supabase offline');
   }
-
-  deleteRecordFromFirestore(recordId).catch(() => {});
 
   return true;
 }
@@ -1969,8 +2307,6 @@ export function saveHolidayToDb(holiday: any) {
       })
       .catch((err) => markCloudSqlUnavailable(err));
   }
-
-  syncHolidayToFirestore(holiday).catch(() => {});
 }
 
 export function deleteHolidayFromDb(fecha: string) {
@@ -1986,8 +2322,6 @@ export function deleteHolidayFromDb(fecha: string) {
       .where(eq(pgHolidays.fecha, fecha))
       .catch((err) => markCloudSqlUnavailable(err));
   }
-
-  deleteHolidayFromFirestore(fecha).catch(() => {});
 }
 
 // Generate complete snapshot of the database
@@ -2022,3 +2356,990 @@ export function getAllDataSnapshot(): {
     holidays: getHolidaysFromDb(),
   };
 }
+
+// Optimized Relational Student Snapshot (reads ONLY records belonging to the student's matricula)
+export function getStudentDataSnapshot(matricula: string): {
+  role: 'student';
+  matricula: string;
+  student: any | null;
+  hospitalZone: any;
+  sites: any[];
+  holidays: any[];
+  records: any[];
+} {
+  const cleanMat = String(matricula || '').trim();
+  const student = getStudentByMatriculaOrIdFromDb(cleanMat);
+  const records = getRecordsFromDb({
+    matricula: cleanMat,
+    limit: 150,
+  });
+
+  return {
+    role: 'student',
+    matricula: cleanMat,
+    student,
+    hospitalZone: getSystemConfig('hospitalZone', {
+      id: 'site-1',
+      nombre: 'Hospital General Los Mochis',
+      direccion: 'Blvd. Macario Gaxiola y Av. Hidalgo, Los Mochis, Sin.',
+      latitude: 25.7925,
+      longitude: -108.996,
+      radiusMeters: 150,
+      horaEntrada: '07:00',
+      horaSalida: '15:00',
+      toleranciaMinutos: 15,
+    }),
+    sites: getSitesFromDb(),
+    holidays: getHolidaysFromDb(),
+    records, // Strict relational filter: zero rows of other students sent
+  };
+}
+
+// Guest Snapshot for login screen (sends 0 attendance records to avoid leaking data or wasting bandwidth)
+export function getGuestDataSnapshot(): {
+  role: 'guest';
+  students: any[];
+  hospitalZone: any;
+  sites: any[];
+  holidays: any[];
+  records: any[];
+} {
+  return {
+    role: 'guest',
+    students: getStudentsFromDb(),
+    hospitalZone: getSystemConfig('hospitalZone', {
+      id: 'site-1',
+      nombre: 'Hospital General Los Mochis',
+      direccion: 'Blvd. Macario Gaxiola y Av. Hidalgo, Los Mochis, Sin.',
+      latitude: 25.7925,
+      longitude: -108.996,
+      radiusMeters: 150,
+      horaEntrada: '07:00',
+      horaSalida: '15:00',
+      toleranciaMinutos: 15,
+    }),
+    sites: getSitesFromDb(),
+    holidays: getHolidaysFromDb(),
+    records: [],
+  };
+}
+
+// Teacher Snapshot with bounded record limit for high performance and low egress
+export function getTeacherDataSnapshot(limit = 250): {
+  role: 'teacher';
+  hospitalZone: any;
+  sites: any[];
+  students: any[];
+  records: any[];
+  masterConfig: any;
+  holidays: any[];
+} {
+  return {
+    role: 'teacher',
+    hospitalZone: getSystemConfig('hospitalZone', {
+      id: 'site-1',
+      nombre: 'Hospital General Los Mochis',
+      direccion: 'Blvd. Macario Gaxiola y Av. Hidalgo, Los Mochis, Sin.',
+      latitude: 25.7925,
+      longitude: -108.996,
+      radiusMeters: 150,
+      horaEntrada: '07:00',
+      horaSalida: '15:00',
+      toleranciaMinutos: 15,
+    }),
+    sites: getSitesFromDb(),
+    students: getStudentsFromDb(),
+    records: getRecordsFromDb({ limit: Math.max(50, limit) }),
+    masterConfig: getSystemConfig('masterConfig', {
+      usuario: 'Moch_Coord_AreaClinica',
+      password: 'L0b0s2026',
+      nombreDocente: 'Coordinación de Área Clínica',
+    }),
+    holidays: getHolidaysFromDb(),
+  };
+}
+
+// ----------------- Supabase Relational Queries (Direct PostgreSQL Index Scans) -----------------
+
+// Query only student's own records from Supabase using B-Tree index scan (idx_records_matricula)
+export async function getStudentRecordsFromSupabaseRelational(
+  matricula: string,
+  options?: { startDate?: string; endDate?: string; limit?: number }
+): Promise<any[]> {
+  if (!isCloudSqlHealthy() || !pgDb || !matricula) return [];
+  const cleanMat = String(matricula).trim();
+  try {
+    const conditions = [eq(pgAttendanceRecords.matricula, cleanMat)];
+    if (options?.startDate) {
+      conditions.push(gte(pgAttendanceRecords.fecha, options.startDate));
+    }
+    if (options?.endDate) {
+      conditions.push(lte(pgAttendanceRecords.fecha, options.endDate));
+    }
+
+    const rows = await pgDb
+      .select()
+      .from(pgAttendanceRecords)
+      .where(and(...conditions))
+      .orderBy(desc(pgAttendanceRecords.fecha), desc(pgAttendanceRecords.horaRegistrada))
+      .limit(options?.limit || 150);
+
+    const records: any[] = [];
+    for (const r of rows) {
+      if (!r || !r.id) continue;
+      const parsed = r.dataJson ? JSON.parse(r.dataJson) : {};
+      const record = {
+        ...parsed,
+        id: r.id,
+        studentId: r.studentId,
+        matricula: r.matricula,
+        studentNombre: r.studentNombre,
+        grupo: r.grupo,
+        equipo: r.equipo,
+        siteId: r.siteId,
+        siteNombre: r.siteNombre,
+        fecha: r.fecha,
+        tipo: r.tipo,
+        horaRegistrada: r.horaRegistrada,
+        estado: r.estado,
+        horaEsperada: r.horaEsperada,
+        toleranciaMinutos: r.toleranciaMinutos,
+        minutosDiferencia: r.minutosDiferencia,
+        latitude: r.latitude,
+        longitude: r.longitude,
+        distanceMeters: r.distanceMeters,
+        accuracyMeters: r.accuracyMeters,
+        dentroDeZona: r.dentroDeZona === 1,
+        deviceId: r.deviceId,
+        deviceName: r.deviceName,
+        verificadoPorGPS: r.verificadoPorGPS === 1,
+        esJustificada: r.esJustificada === 1,
+        motivoJustificante: r.motivoJustificante,
+        createdAt: r.createdAt,
+      };
+      records.push(record);
+      // Mirror to SQLite cache without echo push
+      saveRecordToDb(record, false);
+    }
+    return records;
+  } catch (err: any) {
+    console.warn(`Warning querying Supabase student records for ${matricula}:`, err?.message || err);
+    return [];
+  }
+}
+
+// Query student profile directly from Supabase by matricula
+export async function getStudentFromSupabaseRelational(matricula: string): Promise<any | null> {
+  if (!isCloudSqlHealthy() || !pgDb || !matricula) return null;
+  const cleanMat = String(matricula).trim();
+  try {
+    const rows = await pgDb
+      .select()
+      .from(pgStudents)
+      .where(eq(pgStudents.matricula, cleanMat))
+      .limit(1);
+
+    if (rows.length === 0) return null;
+    const st = rows[0];
+    const parsed = st.dataJson ? JSON.parse(st.dataJson) : {};
+    const student = {
+      ...parsed,
+      id: st.id,
+      matricula: st.matricula,
+      nombre: st.nombre,
+      email: st.email || '',
+      especialidad: st.especialidad || 'Urgencias Médicas',
+      rotacion: st.rotacion || 'Urgencias Médicas',
+      grupo: st.grupo || '10 A',
+      equipo: st.equipo || 'Equipo 1',
+      activo: st.activo === 1,
+      sedeId: st.sedeId || 'site-1',
+      sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+      secondarySedeId: st.secondarySedeId || null,
+      secondarySedeNombre: st.secondarySedeNombre || null,
+      horaEntrada: st.horaEntrada || '07:00',
+      horaSalida: st.horaSalida || '15:00',
+      toleranciaMinutos: st.toleranciaMinutos || 15,
+      diasAsistencia: st.diasAsistencia ? JSON.parse(st.diasAsistencia) : [],
+      horariosPorDia: st.horariosPorDia ? JSON.parse(st.horariosPorDia) : [],
+      linkedDeviceId: st.linkedDeviceId || null,
+      linkedDeviceName: st.linkedDeviceName || null,
+      linkedAt: st.linkedAt || null,
+      updatedAt: st.updatedAt,
+    };
+    saveStudentToDb(student, true, false);
+    return student;
+  } catch (err: any) {
+    console.warn(`Warning querying Supabase student profile for ${matricula}:`, err?.message || err);
+    return null;
+  }
+}
+
+// Compute aggregate stats directly in Supabase PostgreSQL via SQL GROUP BY (minimizes Egress & Disk IO)
+export async function getAttendanceStatsFromSupabaseRelational(
+  startDate?: string,
+  endDate?: string,
+  grupo?: string
+) {
+  if (!isCloudSqlHealthy() || !pgDb) {
+    return null;
+  }
+  try {
+    const whereConditions: any[] = [];
+    if (startDate) {
+      whereConditions.push(gte(pgAttendanceRecords.fecha, startDate));
+    }
+    if (endDate) {
+      whereConditions.push(lte(pgAttendanceRecords.fecha, endDate));
+    }
+    if (grupo && grupo !== 'ALL') {
+      whereConditions.push(eq(pgAttendanceRecords.grupo, grupo));
+    }
+
+    const stateWhere = whereConditions.length > 0 ? and(...whereConditions) : undefined;
+
+    const stateCounts = await pgDb
+      .select({
+        estado: pgAttendanceRecords.estado,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(pgAttendanceRecords)
+      .where(stateWhere)
+      .groupBy(pgAttendanceRecords.estado);
+
+    let total = 0;
+    let aTiempo = 0;
+    let retardos = 0;
+    let faltas = 0;
+    let justificadas = 0;
+
+    for (const row of stateCounts) {
+      const st = String(row.estado || '').toUpperCase();
+      const count = Number(row.count || 0);
+      total += count;
+      if (st === 'A_TIEMPO' || st === 'PRESENTE') aTiempo += count;
+      else if (st === 'RETARDO') retardos += count;
+      else if (st === 'FALTA' || st === 'INASISTENCIA') faltas += count;
+      else if (st === 'JUSTIFICADA') justificadas += count;
+    }
+
+    const dateCounts = await pgDb
+      .select({
+        fecha: pgAttendanceRecords.fecha,
+        estado: pgAttendanceRecords.estado,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(pgAttendanceRecords)
+      .where(stateWhere)
+      .groupBy(pgAttendanceRecords.fecha, pgAttendanceRecords.estado)
+      .orderBy(desc(pgAttendanceRecords.fecha))
+      .limit(60);
+
+    const dateMap = new Map<string, { fecha: string; total: number; aTiempo: number; retardos: number; faltas: number }>();
+    for (const row of dateCounts) {
+      const f = String(row.fecha);
+      const st = String(row.estado).toUpperCase();
+      const count = Number(row.count);
+
+      if (!dateMap.has(f)) {
+        dateMap.set(f, { fecha: f, total: 0, aTiempo: 0, retardos: 0, faltas: 0 });
+      }
+      const entry = dateMap.get(f)!;
+      entry.total += count;
+      if (st === 'A_TIEMPO' || st === 'PRESENTE') entry.aTiempo += count;
+      else if (st === 'RETARDO') entry.retardos += count;
+      else if (st === 'FALTA' || st === 'INASISTENCIA') entry.faltas += count;
+    }
+
+    return {
+      total,
+      aTiempo,
+      retardos,
+      faltas,
+      justificadas,
+      byDate: Array.from(dateMap.values()),
+      source: 'supabase_relational',
+    };
+  } catch (err: any) {
+    console.warn('Notice querying Supabase relational attendance stats:', err?.message || err);
+    return null;
+  }
+}
+
+// ----------------- Supabase Cloud Database Management & Diagnostics -----------------
+
+export function isSupabaseConfigured(): boolean {
+  return isCloudSqlConfigured();
+}
+
+export function isSupabaseHealthy(): boolean {
+  return isCloudSqlHealthy();
+}
+
+export async function syncAllToSupabase(): Promise<{
+  success: boolean;
+  message: string;
+  syncedCounts?: any;
+}> {
+  if (!isCloudSqlConfigured() || !pgDb) {
+    return { success: false, message: 'Supabase PostgreSQL no está configurado o no está disponible' };
+  }
+  try {
+    const snapshot = getAllDataSnapshot();
+
+    // 1. Sync Students in batches of 100
+    const validStudents = snapshot.students.filter((st) => st && st.matricula);
+    const studentChunks = chunkArray(validStudents, 100);
+    for (const chunk of studentChunks) {
+      const rows = chunk.map((st) => ({
+        id: st.id || `std-${st.matricula}`,
+        matricula: String(st.matricula).trim(),
+        nombre: st.nombre || '',
+        email: st.email || '',
+        especialidad: st.especialidad || st.rotacion || 'Urgencias Médicas',
+        rotacion: st.rotacion || st.especialidad || 'Urgencias Médicas',
+        grupo: st.grupo || '10 A',
+        equipo: st.equipo || 'Equipo 1',
+        activo: st.activo !== false ? 1 : 0,
+        sedeId: st.sedeId || 'site-1',
+        sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+        secondarySedeId: st.secondarySedeId || null,
+        secondarySedeNombre: st.secondarySedeNombre || null,
+        horaEntrada: st.horaEntrada || '07:00',
+        horaSalida: st.horaSalida || '15:00',
+        toleranciaMinutos: Number(st.toleranciaMinutos) || 15,
+        diasAsistencia: JSON.stringify(st.diasAsistencia || []),
+        horariosPorDia: JSON.stringify(st.horariosPorDia || []),
+        linkedDeviceId: st.linkedDeviceId || null,
+        linkedDeviceName: st.linkedDeviceName || null,
+        linkedAt: st.linkedAt || null,
+        dataJson: JSON.stringify(st),
+        updatedAt: st.updatedAt || new Date().toISOString(),
+      }));
+
+      if (rows.length > 0) {
+        await pgDb
+          .insert(pgStudents)
+          .values(rows)
+          .onConflictDoUpdate({
+            target: pgStudents.matricula,
+            set: {
+              nombre: sql`excluded.nombre`,
+              email: sql`excluded.email`,
+              especialidad: sql`excluded.especialidad`,
+              rotacion: sql`excluded.rotacion`,
+              grupo: sql`excluded.grupo`,
+              equipo: sql`excluded.equipo`,
+              activo: sql`excluded.activo`,
+              sedeId: sql`excluded.sede_id`,
+              sedeNombre: sql`excluded.sede_nombre`,
+              secondarySedeId: sql`excluded.secondary_sede_id`,
+              secondarySedeNombre: sql`excluded.secondary_sede_nombre`,
+              horaEntrada: sql`excluded.hora_entrada`,
+              horaSalida: sql`excluded.hora_salida`,
+              toleranciaMinutos: sql`excluded.tolerancia_minutos`,
+              diasAsistencia: sql`excluded.dias_asistencia`,
+              horariosPorDia: sql`excluded.horarios_por_dia`,
+              linkedDeviceId: sql`excluded.linked_device_id`,
+              linkedDeviceName: sql`excluded.linked_device_name`,
+              linkedAt: sql`excluded.linked_at`,
+              dataJson: sql`excluded.data_json`,
+              updatedAt: sql`excluded.updated_at`,
+            },
+          });
+      }
+    }
+
+    // 2. Sync Sites in batch
+    const validSites = snapshot.sites.filter((s) => s && s.id);
+    if (validSites.length > 0) {
+      const siteRows = validSites.map((s) => ({
+        id: s.id,
+        nombre: s.nombre || '',
+        direccion: s.direccion || '',
+        latitude: Number(s.latitude) || 0,
+        longitude: Number(s.longitude) || 0,
+        radiusMeters: Number(s.radiusMeters) || 150,
+        horaEntrada: s.horaEntrada || '07:00',
+        horaSalida: s.horaSalida || '15:00',
+        toleranciaMinutos: Number(s.toleranciaMinutos) || 15,
+        dataJson: JSON.stringify(s),
+        updatedAt: s.updatedAt || new Date().toISOString(),
+      }));
+
+      await pgDb
+        .insert(pgSites)
+        .values(siteRows)
+        .onConflictDoUpdate({
+          target: pgSites.id,
+          set: {
+            nombre: sql`excluded.nombre`,
+            direccion: sql`excluded.direccion`,
+            latitude: sql`excluded.latitude`,
+            longitude: sql`excluded.longitude`,
+            radiusMeters: sql`excluded.radius_meters`,
+            horaEntrada: sql`excluded.hora_entrada`,
+            horaSalida: sql`excluded.hora_salida`,
+            toleranciaMinutos: sql`excluded.tolerancia_minutos`,
+            dataJson: sql`excluded.data_json`,
+            updatedAt: sql`excluded.updated_at`,
+          },
+        });
+    }
+
+    // 3. Sync Attendance Records in batches of 150
+    const validRecords = snapshot.records.filter((r) => r && r.id);
+    const recordChunks = chunkArray(validRecords, 150);
+    for (const chunk of recordChunks) {
+      const rows = chunk.map((r) => {
+        const resolvedEstado =
+          r.esJustificada || r.checkInStatus === 'JUSTIFICADA' || r.estado === 'JUSTIFICADA'
+            ? 'JUSTIFICADA'
+            : (r.checkInStatus || r.estado || 'A_TIEMPO');
+        return {
+          id: r.id,
+          studentId: r.studentId || '',
+          matricula: r.matricula ? String(r.matricula).trim() : '',
+          studentNombre: r.studentNombre || '',
+          grupo: r.grupo || '',
+          equipo: r.equipo || '',
+          siteId: r.siteId || '',
+          siteNombre: r.siteNombre || '',
+          fecha: r.fecha || '',
+          tipo: r.tipo || (resolvedEstado === 'JUSTIFICADA' ? 'JUSTIFICANTE' : 'ENTRADA'),
+          horaRegistrada: r.horaRegistrada || '',
+          estado: resolvedEstado,
+          horaEsperada: r.horaEsperada || '',
+          toleranciaMinutos: Number(r.toleranciaMinutos) || 15,
+          minutosDiferencia: Number(r.minutosDiferencia) || 0,
+          latitude: Number(r.latitude) || 0,
+          longitude: Number(r.longitude) || 0,
+          distanceMeters: Number(r.distanceMeters) || 0,
+          accuracyMeters: Number(r.accuracyMeters) || 0,
+          dentroDeZona: r.dentroDeZona ? 1 : 0,
+          deviceId: r.deviceId || '',
+          deviceName: r.deviceName || '',
+          verificadoPorGPS: r.verificadoPorGPS ? 1 : 0,
+          esJustificada: (r.esJustificada || resolvedEstado === 'JUSTIFICADA') ? 1 : 0,
+          motivoJustificante: r.motivoJustificante || '',
+          dataJson: JSON.stringify(r),
+          createdAt: r.fecha || new Date().toISOString(),
+        };
+      });
+
+      if (rows.length > 0) {
+        await pgDb
+          .insert(pgAttendanceRecords)
+          .values(rows)
+          .onConflictDoUpdate({
+            target: pgAttendanceRecords.id,
+            set: {
+              horaRegistrada: sql`excluded.hora_registrada`,
+              estado: sql`excluded.estado`,
+              esJustificada: sql`excluded.es_justificada`,
+              motivoJustificante: sql`excluded.motivo_justificante`,
+              dataJson: sql`excluded.data_json`,
+            },
+          });
+      }
+    }
+
+    // 4. Sync Holidays in batch
+    const validHolidays = snapshot.holidays.filter((h) => h && h.fecha);
+    if (validHolidays.length > 0) {
+      const holidayRows = validHolidays.map((h) => ({
+        fecha: h.fecha,
+        descripcion: h.descripcion || '',
+        creadoPor: h.creadoPor || '',
+        fechaCreacion: h.fechaCreacion || new Date().toISOString(),
+      }));
+
+      await pgDb
+        .insert(pgHolidays)
+        .values(holidayRows)
+        .onConflictDoUpdate({
+          target: pgHolidays.fecha,
+          set: {
+            descripcion: sql`excluded.descripcion`,
+            creadoPor: sql`excluded.creado_por`,
+            fechaCreacion: sql`excluded.fecha_creacion`,
+          },
+        });
+    }
+
+    // 5. Sync System Config
+    if (snapshot.hospitalZone) {
+      await pgDb
+        .insert(pgSystemConfig)
+        .values({
+          key: 'hospitalZone',
+          value: JSON.stringify(snapshot.hospitalZone),
+          updatedAt: new Date().toISOString(),
+        })
+        .onConflictDoUpdate({
+          target: pgSystemConfig.key,
+          set: {
+            value: JSON.stringify(snapshot.hospitalZone),
+            updatedAt: new Date().toISOString(),
+          },
+        });
+    }
+    if (snapshot.masterConfig) {
+      await pgDb
+        .insert(pgSystemConfig)
+        .values({
+          key: 'masterConfig',
+          value: JSON.stringify(snapshot.masterConfig),
+          updatedAt: new Date().toISOString(),
+        })
+        .onConflictDoUpdate({
+          target: pgSystemConfig.key,
+          set: {
+            value: JSON.stringify(snapshot.masterConfig),
+            updatedAt: new Date().toISOString(),
+          },
+        });
+    }
+
+    return {
+      success: true,
+      message: `Sincronización masiva con Supabase completada con éxito (${snapshot.students.length} alumnos, ${snapshot.records.length} checadas, ${snapshot.sites.length} sedes).`,
+      syncedCounts: {
+        students: snapshot.students.length,
+        records: snapshot.records.length,
+        sites: snapshot.sites.length,
+        holidays: snapshot.holidays.length,
+      },
+    };
+  } catch (err: any) {
+    return { success: false, message: `Error sincronizando con Supabase: ${err.message}` };
+  }
+}
+
+// Performs a bandwidth-conserving Delta Sync from Supabase:
+// 1. Students updated after local max(updated_at)
+// 2. Sites updated after local max(updated_at)
+// 3. New students enrolled in Supabase that don't exist locally
+// 4. Attendance records from the last N days (default 7 days)
+export async function performDeltaSyncFromSupabase(options?: {
+  attendanceDaysBack?: number;
+}): Promise<{
+  success: boolean;
+  studentsUpdated: number;
+  sitesUpdated: number;
+  recordsSynced: number;
+  message: string;
+}> {
+  if (!isCloudSqlConfigured() || !pgDb || !isCloudSqlHealthy()) {
+    return {
+      success: false,
+      studentsUpdated: 0,
+      sitesUpdated: 0,
+      recordsSynced: 0,
+      message: 'Supabase PostgreSQL no está configurado o no está disponible',
+    };
+  }
+
+  if (!db) {
+    return {
+      success: false,
+      studentsUpdated: 0,
+      sitesUpdated: 0,
+      recordsSynced: 0,
+      message: 'Base de datos SQLite local no inicializada',
+    };
+  }
+
+  let studentsUpdated = 0;
+  let sitesUpdated = 0;
+  let recordsSynced = 0;
+
+  try {
+    console.log('⚡ [Delta Sync] Starting smart delta sync with Supabase...');
+
+    // 1. STUDENTS DELTA: Query only students modified after the latest local updatedAt
+    let maxLocalStudentUpdatedAt = '1970-01-01T00:00:00.000Z';
+    try {
+      const res = db.exec(`SELECT MAX(updated_at) FROM students WHERE updated_at IS NOT NULL AND updated_at != ''`);
+      if (res.length > 0 && res[0].values.length > 0 && res[0].values[0][0]) {
+        maxLocalStudentUpdatedAt = String(res[0].values[0][0]);
+      }
+    } catch {}
+
+    const deltaStudents = await pgDb
+      .select()
+      .from(pgStudents)
+      .where(gt(pgStudents.updatedAt, maxLocalStudentUpdatedAt));
+
+    if (deltaStudents.length > 0) {
+      console.log(`📥 [Delta Sync] Pulling ${deltaStudents.length} updated students from Supabase (newer than ${maxLocalStudentUpdatedAt})...`);
+      for (const st of deltaStudents) {
+        if (!st || !st.matricula) continue;
+        const parsedData = st.dataJson ? JSON.parse(st.dataJson) : {};
+        saveStudentToDb({
+          ...parsedData,
+          id: st.id,
+          matricula: st.matricula,
+          nombre: st.nombre,
+          email: st.email || '',
+          especialidad: st.especialidad || 'Urgencias Médicas',
+          rotacion: st.rotacion || 'Urgencias Médicas',
+          grupo: st.grupo || '10 A',
+          equipo: st.equipo || 'Equipo 1',
+          activo: st.activo === 1,
+          sedeId: st.sedeId || 'site-1',
+          sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+          secondarySedeId: st.secondarySedeId || null,
+          secondarySedeNombre: st.secondarySedeNombre || null,
+          horaEntrada: st.horaEntrada || '07:00',
+          horaSalida: st.horaSalida || '15:00',
+          toleranciaMinutos: st.toleranciaMinutos || 15,
+          diasAsistencia: st.diasAsistencia ? JSON.parse(st.diasAsistencia) : [],
+          horariosPorDia: st.horariosPorDia ? JSON.parse(st.horariosPorDia) : [],
+          linkedDeviceId: st.linkedDeviceId || null,
+          linkedDeviceName: st.linkedDeviceName || null,
+          linkedAt: st.linkedAt || null,
+          updatedAt: st.updatedAt,
+        }, false, false);
+        studentsUpdated++;
+      }
+    }
+
+    // Check if Supabase has additional students not present locally
+    const localCountRes = db.exec(`SELECT count(*) FROM students`);
+    const localCount = Number(localCountRes[0]?.values[0]?.[0]) || 0;
+    const remoteCountRes = await pgDb.select({ count: sql<number>`count(*)` }).from(pgStudents);
+    const remoteCount = Number(remoteCountRes[0]?.count) || 0;
+
+    if (remoteCount > localCount) {
+      console.log(`📥 [Delta Sync] Supabase contains ${remoteCount} students vs ${localCount} locally. Checking for missing students...`);
+      const allRemote = await pgDb.select().from(pgStudents);
+      for (const st of allRemote) {
+        if (!st || !st.matricula) continue;
+        const existingLocal = getStudentByMatriculaOrIdFromDb(st.matricula);
+        if (!existingLocal) {
+          const parsedData = st.dataJson ? JSON.parse(st.dataJson) : {};
+          saveStudentToDb({
+            ...parsedData,
+            id: st.id,
+            matricula: st.matricula,
+            nombre: st.nombre,
+            email: st.email || '',
+            especialidad: st.especialidad || 'Urgencias Médicas',
+            rotacion: st.rotacion || 'Urgencias Médicas',
+            grupo: st.grupo || '10 A',
+            equipo: st.equipo || 'Equipo 1',
+            activo: st.activo === 1,
+            sedeId: st.sedeId || 'site-1',
+            sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+            secondarySedeId: st.secondarySedeId || null,
+            secondarySedeNombre: st.secondarySedeNombre || null,
+            horaEntrada: st.horaEntrada || '07:00',
+            horaSalida: st.horaSalida || '15:00',
+            toleranciaMinutos: st.toleranciaMinutos || 15,
+            diasAsistencia: st.diasAsistencia ? JSON.parse(st.diasAsistencia) : [],
+            horariosPorDia: st.horariosPorDia ? JSON.parse(st.horariosPorDia) : [],
+            linkedDeviceId: st.linkedDeviceId || null,
+            linkedDeviceName: st.linkedDeviceName || null,
+            linkedAt: st.linkedAt || null,
+            updatedAt: st.updatedAt,
+          }, false, false);
+          studentsUpdated++;
+        }
+      }
+    }
+
+    // 2. SITES DELTA: Query only sites modified after the latest local updatedAt
+    let maxLocalSiteUpdatedAt = '1970-01-01T00:00:00.000Z';
+    try {
+      const res = db.exec(`SELECT MAX(updated_at) FROM sites WHERE updated_at IS NOT NULL AND updated_at != ''`);
+      if (res.length > 0 && res[0].values.length > 0 && res[0].values[0][0]) {
+        maxLocalSiteUpdatedAt = String(res[0].values[0][0]);
+      }
+    } catch {}
+
+    const deltaSites = await pgDb
+      .select()
+      .from(pgSites)
+      .where(gt(pgSites.updatedAt, maxLocalSiteUpdatedAt));
+
+    if (deltaSites.length > 0) {
+      console.log(`📥 [Delta Sync] Pulling ${deltaSites.length} updated sites from Supabase...`);
+      for (const s of deltaSites) {
+        if (!s || !s.id) continue;
+        const parsed = s.dataJson ? JSON.parse(s.dataJson) : {};
+        saveSiteToDb({
+          ...parsed,
+          id: s.id,
+          nombre: s.nombre,
+          direccion: s.direccion,
+          latitude: s.latitude,
+          longitude: s.longitude,
+          radiusMeters: s.radiusMeters,
+          horaEntrada: s.horaEntrada,
+          horaSalida: s.horaSalida,
+          toleranciaMinutos: s.toleranciaMinutos,
+          updatedAt: s.updatedAt,
+        }, false, false);
+        sitesUpdated++;
+      }
+    }
+
+    // 3. ATTENDANCE RECORDS DELTA: Fetch recent attendance records within window (default 7 days)
+    const daysBack = options?.attendanceDaysBack ?? 7;
+    const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    const recentRemoteRecords = await pgDb
+      .select()
+      .from(pgAttendanceRecords)
+      .where(gte(pgAttendanceRecords.fecha, cutoffDate));
+
+    if (recentRemoteRecords.length > 0) {
+      console.log(`📥 [Delta Sync] Pulling ${recentRemoteRecords.length} attendance records from the past ${daysBack} days (since ${cutoffDate})...`);
+      for (const r of recentRemoteRecords) {
+        if (!r || !r.id) continue;
+        const data = r.dataJson ? JSON.parse(r.dataJson) : {};
+        saveRecordToDb({
+          ...data,
+          id: r.id,
+          studentId: r.studentId,
+          matricula: r.matricula,
+          studentNombre: r.studentNombre,
+          grupo: r.grupo,
+          equipo: r.equipo,
+          siteId: r.siteId,
+          siteNombre: r.siteNombre,
+          fecha: r.fecha,
+          tipo: r.tipo,
+          horaRegistrada: r.horaRegistrada,
+          estado: r.estado,
+          horaEsperada: r.horaEsperada,
+          toleranciaMinutos: r.toleranciaMinutos,
+          minutosDiferencia: r.minutosDiferencia,
+          latitude: r.latitude,
+          longitude: r.longitude,
+          distanceMeters: r.distanceMeters,
+          accuracyMeters: r.accuracyMeters,
+          dentroDeZona: r.dentroDeZona === 1,
+          deviceId: r.deviceId,
+          deviceName: r.deviceName,
+          verificadoPorGPS: r.verificadoPorGPS === 1,
+          esJustificada: r.esJustificada === 1,
+          motivoJustificante: r.motivoJustificante,
+        }, false);
+        recordsSynced++;
+      }
+    }
+
+    if (studentsUpdated > 0 || sitesUpdated > 0 || recordsSynced > 0) {
+      persistDatabase(true);
+    }
+
+    const message = `Delta Sync completado: ${studentsUpdated} alumnos actualizados, ${sitesUpdated} sedes actualizadas, ${recordsSynced} checadas sincronizadas.`;
+    console.log(`✅ [Delta Sync] ${message}`);
+    return {
+      success: true,
+      studentsUpdated,
+      sitesUpdated,
+      recordsSynced,
+      message,
+    };
+  } catch (err: any) {
+    console.warn('⚠️ [Delta Sync] Error during delta sync:', err);
+    markCloudSqlUnavailable(err);
+    return {
+      success: false,
+      studentsUpdated,
+      sitesUpdated,
+      recordsSynced,
+      message: `Error en Delta Sync: ${err?.message || err}`,
+    };
+  }
+}
+
+export async function pullFromSupabaseToCache(forceFull = false): Promise<{
+  success: boolean;
+  message: string;
+  changed?: boolean;
+}> {
+  if (!isCloudSqlConfigured() || !pgDb) {
+    return { success: false, message: 'Supabase PostgreSQL no está configurado o no está disponible' };
+  }
+  try {
+    createAutoBackupBeforeRestore();
+
+    const remoteStudents = await pgDb.select().from(pgStudents);
+    const remoteSites = await pgDb.select().from(pgSites);
+    const remoteRecords = await pgDb.select().from(pgAttendanceRecords);
+    const remoteHolidays = await pgDb.select().from(pgHolidays);
+    const remoteConfig = await pgDb.select().from(pgSystemConfig);
+
+    for (const st of remoteStudents) {
+      if (!st || !st.matricula) continue;
+      const data = st.dataJson ? JSON.parse(st.dataJson) : {};
+      saveStudentToDb({
+        ...data,
+        id: st.id,
+        matricula: st.matricula,
+        nombre: st.nombre,
+        email: st.email || '',
+        especialidad: st.especialidad || 'Urgencias Médicas',
+        rotacion: st.rotacion || 'Urgencias Médicas',
+        grupo: st.grupo || '10 A',
+        equipo: st.equipo || 'Equipo 1',
+        activo: st.activo === 1,
+        sedeId: st.sedeId || 'site-1',
+        sedeNombre: st.sedeNombre || 'Hospital General Los Mochis',
+        secondarySedeId: st.secondarySedeId || null,
+        secondarySedeNombre: st.secondarySedeNombre || null,
+        horaEntrada: st.horaEntrada || '07:00',
+        horaSalida: st.horaSalida || '15:00',
+        toleranciaMinutos: st.toleranciaMinutos || 15,
+        diasAsistencia: st.diasAsistencia ? JSON.parse(st.diasAsistencia) : [],
+        horariosPorDia: st.horariosPorDia ? JSON.parse(st.horariosPorDia) : [],
+        linkedDeviceId: st.linkedDeviceId || null,
+        linkedDeviceName: st.linkedDeviceName || null,
+        linkedAt: st.linkedAt || null,
+        updatedAt: st.updatedAt,
+      }, false, false);
+    }
+
+    for (const s of remoteSites) {
+      if (!s || !s.id) continue;
+      const data = s.dataJson ? JSON.parse(s.dataJson) : {};
+      saveSiteToDb({
+        ...data,
+        id: s.id,
+        nombre: s.nombre,
+        direccion: s.direccion,
+        latitude: s.latitude,
+        longitude: s.longitude,
+        radiusMeters: s.radiusMeters,
+        horaEntrada: s.horaEntrada,
+        horaSalida: s.horaSalida,
+        toleranciaMinutos: s.toleranciaMinutos,
+        updatedAt: s.updatedAt,
+      });
+    }
+
+    for (const r of remoteRecords) {
+      if (!r || !r.id) continue;
+      const data = r.dataJson ? JSON.parse(r.dataJson) : {};
+      saveRecordToDb({
+        ...data,
+        id: r.id,
+        studentId: r.studentId,
+        matricula: r.matricula,
+        studentNombre: r.studentNombre,
+        grupo: r.grupo,
+        equipo: r.equipo,
+        siteId: r.siteId,
+        siteNombre: r.siteNombre,
+        fecha: r.fecha,
+        tipo: r.tipo,
+        horaRegistrada: r.horaRegistrada,
+        estado: r.estado,
+        horaEsperada: r.horaEsperada,
+        toleranciaMinutos: r.toleranciaMinutos,
+        minutosDiferencia: r.minutosDiferencia,
+        latitude: r.latitude,
+        longitude: r.longitude,
+        distanceMeters: r.distanceMeters,
+        accuracyMeters: r.accuracyMeters,
+        dentroDeZona: r.dentroDeZona === 1,
+        deviceId: r.deviceId,
+        deviceName: r.deviceName,
+        verificadoPorGPS: r.verificadoPorGPS === 1,
+        esJustificada: r.esJustificada === 1,
+        motivoJustificante: r.motivoJustificante,
+      });
+    }
+
+    for (const h of remoteHolidays) {
+      if (!h || !h.fecha) continue;
+      saveHolidayToDb({
+        fecha: h.fecha,
+        descripcion: h.descripcion,
+        creadoPor: h.creadoPor,
+        fechaCreacion: h.fechaCreacion,
+      });
+    }
+
+    for (const c of remoteConfig) {
+      try {
+        setSystemConfigInternal(c.key, JSON.parse(c.value));
+      } catch {
+        setSystemConfigInternal(c.key, c.value);
+      }
+    }
+
+    persistDatabase(true);
+
+    return {
+      success: true,
+      message: `Datos recuperados exitosamente desde Supabase (${remoteStudents.length} alumnos, ${remoteRecords.length} checadas).`,
+      changed: true,
+    };
+  } catch (err: any) {
+    return { success: false, message: `Error recuperando datos de Supabase: ${err.message}` };
+  }
+}
+
+export async function getSupabaseDiagnostics() {
+  const configured = isCloudSqlConfigured();
+  const snapshot = getAllDataSnapshot();
+  let supabaseCounts: any = undefined;
+
+  if (configured && pgDb) {
+    try {
+      const [st, ar, si, ho] = await Promise.all([
+        pgDb.select({ count: sql`count(*)` }).from(pgStudents),
+        pgDb.select({ count: sql`count(*)` }).from(pgAttendanceRecords),
+        pgDb.select({ count: sql`count(*)` }).from(pgSites),
+        pgDb.select({ count: sql`count(*)` }).from(pgHolidays),
+      ]);
+      supabaseCounts = {
+        students: Number(st[0]?.count || 0),
+        records: Number(ar[0]?.count || 0),
+        sites: Number(si[0]?.count || 0),
+        holidays: Number(ho[0]?.count || 0),
+      };
+    } catch (err) {
+      console.warn('Supabase diagnostics count error:', err);
+    }
+  }
+
+  return {
+    configured,
+    provider: 'Supabase PostgreSQL',
+    status: configured ? 'ONLINE' : 'OFFLINE',
+    lastSyncTimestamp: Date.now(),
+    lastSyncIso: new Date().toISOString(),
+    lastSyncStatus: configured ? 'OK' : 'NOT_CONFIGURED',
+    pendingOutboxCount: getPendingCloudSyncCount(),
+    localCounts: {
+      students: snapshot.students.length,
+      records: snapshot.records.length,
+      sites: snapshot.sites.length,
+      holidays: snapshot.holidays.length,
+    },
+    supabaseCounts,
+  };
+}
+
+export function getSupabaseStatusInfo() {
+  const configured = isCloudSqlConfigured();
+  return {
+    configured,
+    provider: 'Supabase PostgreSQL',
+    status: configured ? 'ONLINE' : 'NOT_CONFIGURED',
+    circuitBreakerOpen: false,
+    pendingOutboxCount: getPendingCloudSyncCount(),
+    lastSyncTimestamp: Date.now(),
+    lastSyncIso: new Date().toISOString(),
+    message: configured
+      ? 'Base de datos Supabase PostgreSQL conectada y activa en la nube.'
+      : 'Supabase PostgreSQL no configurado.',
+  };
+}
+

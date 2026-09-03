@@ -105,24 +105,52 @@ export function mergeClientStudentSafely(existing: Student | null | undefined, i
 }
 
 // Sync helper from Express Backend API (Client reads authoritative server state)
+export interface CloudSyncOptions {
+  role?: 'teacher' | 'student' | 'guest';
+  studentId?: string;
+  matricula?: string;
+  limit?: number;
+}
+
 let isSyncingBackend = false;
 let pendingSyncAgain = false;
+let activeSyncOptions: CloudSyncOptions = { role: 'guest' };
 
-export async function syncFromExpressBackend(): Promise<void> {
+export async function syncFromExpressBackend(options?: CloudSyncOptions): Promise<void> {
+  if (options) {
+    activeSyncOptions = { ...activeSyncOptions, ...options };
+  }
   if (isSyncingBackend) {
     pendingSyncAgain = true;
     return;
   }
   isSyncingBackend = true;
   try {
-    const res = await fetch('/api/sync');
+    const params = new URLSearchParams();
+    if (activeSyncOptions.role) params.append('role', activeSyncOptions.role);
+    if (activeSyncOptions.matricula) params.append('matricula', activeSyncOptions.matricula);
+    if (activeSyncOptions.studentId) params.append('studentId', activeSyncOptions.studentId);
+    if (activeSyncOptions.limit) params.append('limit', String(activeSyncOptions.limit));
+
+    const queryString = params.toString();
+    const url = queryString ? `/api/sync?${queryString}` : '/api/sync';
+    const res = await fetch(url);
     if (res.ok) {
       const data = await res.json();
       if (data.hospitalZone) localStorage.setItem(KEYS.HOSPITAL, JSON.stringify(data.hospitalZone));
       if (Array.isArray(data.sites) && data.sites.length > 0) {
         localStorage.setItem(KEYS.SITES, JSON.stringify(data.sites));
       }
-      if (Array.isArray(data.students)) {
+      // If server sent single student profile (student role)
+      if (data.student) {
+        const localStudents = getStudents();
+        const sanitized = sanitizeStudentSchedules(data.student);
+        const exists = localStudents.some(s => s.id === sanitized.id || isMatriculaMatch(s.matricula, sanitized.matricula));
+        const updated = exists
+          ? localStudents.map(s => (s.id === sanitized.id || isMatriculaMatch(s.matricula, sanitized.matricula)) ? mergeClientStudentSafely(s, sanitized) : s)
+          : [...localStudents, sanitized];
+        localStorage.setItem(KEYS.STUDENTS, JSON.stringify(updated));
+      } else if (Array.isArray(data.students)) {
         const localStudents = getStudents();
         const serverStudents = data.students.map(sanitizeStudentSchedules);
 
@@ -157,14 +185,12 @@ export async function syncFromExpressBackend(): Promise<void> {
               if (merged.id) seenIds.add(merged.id);
               if (matKey) seenMats.add(matKey);
 
-              // If local version is strictly newer than what server sent, queue to push back to server
               if (localTime > serverTime && localTime > 0) {
                 locallyNewerToPush.push(merged);
               }
             }
           }
 
-          // Retain any local-only students that aren't on server yet
           for (const lSt of localStudents) {
             const matKey = lSt.matricula ? String(lSt.matricula).trim().toLowerCase() : '';
             const alreadyPresent = (lSt.id && seenIds.has(lSt.id)) || (matKey && seenMats.has(matKey));
@@ -176,7 +202,6 @@ export async function syncFromExpressBackend(): Promise<void> {
 
           localStorage.setItem(KEYS.STUDENTS, JSON.stringify(mergedStudents));
 
-          // If there were newer local edits, push them to the server so server & cloud stay updated
           if (locallyNewerToPush.length > 0) {
             fetch('/api/students', {
               method: 'POST',
@@ -192,30 +217,57 @@ export async function syncFromExpressBackend(): Promise<void> {
       }
       if (Array.isArray(data.records)) {
         const localRecords = getAttendanceRecords();
-        if (localRecords.length === 0) {
-          localStorage.setItem(KEYS.RECORDS, JSON.stringify(data.records));
-        } else {
+        if (activeSyncOptions.role === 'student' && (activeSyncOptions.matricula || activeSyncOptions.studentId)) {
+          // Relational student isolation: replace only this student's records with authoritative data
+          const studentMat = String(activeSyncOptions.matricula || '').trim().toLowerCase();
+          const studentId = activeSyncOptions.studentId || '';
+
+          const otherRecords = localRecords.filter((r) => {
+            const rMat = (r.matricula || '').trim().toLowerCase();
+            const rId = r.studentId || '';
+            return !(rMat === studentMat || (studentId && rId === studentId));
+          });
+
           const recMap = new Map<string, AttendanceRecord>();
-          // Index server records
           data.records.forEach((r: AttendanceRecord) => {
             if (r && r.id) recMap.set(r.id, r);
           });
-          // Keep local records not yet on server
-          const missingOnServer: AttendanceRecord[] = [];
+          // Retain any pending unsynced student record created locally
           localRecords.forEach((lr) => {
-            if (lr && lr.id && !recMap.has(lr.id)) {
+            const lrMat = (lr.matricula || '').trim().toLowerCase();
+            const lrId = lr.studentId || '';
+            if ((lrMat === studentMat || (studentId && lrId === studentId)) && lr.id && !recMap.has(lr.id)) {
               recMap.set(lr.id, lr);
-              missingOnServer.push(lr);
             }
           });
-          const mergedRecords = Array.from(recMap.values());
+
+          const mergedRecords = [...Array.from(recMap.values()), ...otherRecords];
           localStorage.setItem(KEYS.RECORDS, JSON.stringify(mergedRecords));
-          if (missingOnServer.length > 0) {
-            fetch('/api/records', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(missingOnServer),
-            }).catch(console.warn);
+        } else {
+          // Teacher or admin role merge
+          if (localRecords.length === 0) {
+            localStorage.setItem(KEYS.RECORDS, JSON.stringify(data.records));
+          } else {
+            const recMap = new Map<string, AttendanceRecord>();
+            data.records.forEach((r: AttendanceRecord) => {
+              if (r && r.id) recMap.set(r.id, r);
+            });
+            const missingOnServer: AttendanceRecord[] = [];
+            localRecords.forEach((lr) => {
+              if (lr && lr.id && !recMap.has(lr.id)) {
+                recMap.set(lr.id, lr);
+                missingOnServer.push(lr);
+              }
+            });
+            const mergedRecords = Array.from(recMap.values());
+            localStorage.setItem(KEYS.RECORDS, JSON.stringify(mergedRecords));
+            if (missingOnServer.length > 0) {
+              fetch('/api/records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(missingOnServer),
+              }).catch(console.warn);
+            }
           }
         }
       }
@@ -1045,15 +1097,9 @@ export async function clearSemesterStudents(): Promise<void> {
   }
 }
 
-export interface CloudSyncOptions {
-  role?: 'teacher' | 'student' | 'guest';
-  studentId?: string;
-  matricula?: string;
-}
-
 export function subscribeToCloudChanges(
   onUpdate: () => void,
-  _options: CloudSyncOptions = { role: 'guest' }
+  options: CloudSyncOptions = { role: 'guest' }
 ): () => void {
   initializeStorage();
 
@@ -1064,14 +1110,14 @@ export function subscribeToCloudChanges(
     if (debounceTimeout) clearTimeout(debounceTimeout);
     debounceTimeout = setTimeout(() => {
       if (!isSubscribed) return;
-      syncFromExpressBackend().then(() => {
+      syncFromExpressBackend(options).then(() => {
         if (isSubscribed) onUpdate();
       });
     }, 300);
   };
 
-  // Initial sync from Express backend
-  syncFromExpressBackend().then(() => {
+  // Initial sync from Express backend with explicit role & credentials
+  syncFromExpressBackend(options).then(() => {
     if (isSubscribed) onUpdate();
   });
 
@@ -1205,7 +1251,7 @@ export async function importFullSystemBackup(
   }
 }
 
-// ----------------- SUPABASE MASTER & RETENTION CLIENT HELPERS -----------------
+// ----------------- SUPABASE CLOUD & RETENTION CLIENT HELPERS -----------------
 export async function purgeOldAttendanceRecordsFromServer(
   retentionDays = 60
 ): Promise<{ success: boolean; purgedCount: number; cutoffDate: string; remainingCount: number; message: string }> {
@@ -1229,10 +1275,10 @@ export async function purgeOldAttendanceRecordsFromServer(
   }
 }
 
-export async function fetchFirebaseStatus(): Promise<{
+export async function fetchSupabaseStatus(): Promise<{
   configured: boolean;
-  projectId: string | null;
-  databaseId?: string | null;
+  provider?: string;
+  projectId?: string | null;
   status?: string;
   circuitBreakerOpen?: boolean;
   lastSyncTimestamp?: number;
@@ -1240,25 +1286,24 @@ export async function fetchFirebaseStatus(): Promise<{
   message: string;
 }> {
   try {
-    const res = await fetch('/api/firebase/status');
+    const res = await fetch('/api/supabase/status');
     if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
     return await res.json();
   } catch (err: any) {
     return {
       configured: false,
-      projectId: null,
       message: err.message,
     };
   }
 }
 
-export async function syncAllToFirebaseNow(): Promise<{
+export async function syncAllToSupabaseNow(): Promise<{
   success: boolean;
   message: string;
   syncedCounts?: any;
 }> {
   try {
-    const res = await fetch('/api/firebase/sync', {
+    const res = await fetch('/api/supabase/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -1272,14 +1317,14 @@ export async function syncAllToFirebaseNow(): Promise<{
   }
 }
 
-export async function pullFirebaseMasterNow(forceFull = false): Promise<{
+export async function pullSupabaseMasterNow(forceFull = false): Promise<{
   success: boolean;
   message: string;
   changed?: boolean;
   details?: any;
 }> {
   try {
-    const res = await fetch('/api/firebase/pull', {
+    const res = await fetch('/api/supabase/pull', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ forceFull }),
@@ -1294,9 +1339,9 @@ export async function pullFirebaseMasterNow(forceFull = false): Promise<{
   }
 }
 
-export async function fetchFirebaseDiagnostics(): Promise<any> {
+export async function fetchSupabaseDiagnostics(): Promise<any> {
   try {
-    const res = await fetch('/api/firebase/diagnostics');
+    const res = await fetch('/api/supabase/diagnostics');
     if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
     return await res.json();
   } catch (err: any) {

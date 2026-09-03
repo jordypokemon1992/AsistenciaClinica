@@ -6,6 +6,12 @@ import {
   initDatabase,
   persistDatabase,
   getAllDataSnapshot,
+  getStudentDataSnapshot,
+  getGuestDataSnapshot,
+  getTeacherDataSnapshot,
+  getStudentRecordsFromSupabaseRelational,
+  getStudentFromSupabaseRelational,
+  getAttendanceStatsFromSupabaseRelational,
   getSitesFromDb,
   saveSiteToDb,
   deleteSiteFromDb,
@@ -31,27 +37,16 @@ import {
   importFullSnapshotToSqlite,
   analyzeStateDiffFromDb,
   createAutoBackupBeforeRestore,
+  isSupabaseConfigured,
+  isSupabaseHealthy,
+  syncAllToSupabase,
+  pullFromSupabaseToCache,
+  performDeltaSyncFromSupabase,
+  getSupabaseDiagnostics,
+  getSupabaseStatusInfo,
+  getPendingCloudSyncCount,
+  processPendingCloudSyncQueue,
 } from './src/server/db';
-import {
-  isFirestoreConfigured,
-  syncAllToFirestore,
-  pullFromFirestoreToCache,
-  reconcileStartupFromFirestore,
-  fetchStudentRecordsFromFirestore,
-  getFirestoreDiagnostics,
-  getFirestoreStatusInfo,
-  syncStudentToFirestore,
-  syncMultipleStudentsToFirestore,
-  deleteStudentFromFirestore,
-  syncRecordToFirestore,
-  syncMultipleRecordsToFirestore,
-  deleteRecordFromFirestore,
-  syncSiteToFirestore,
-  deleteSiteFromFirestore,
-  syncHolidayToFirestore,
-  deleteHolidayFromFirestore,
-  syncConfigToFirestore,
-} from './src/server/firestore';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -106,64 +101,115 @@ app.get(['/api/health', '/health', '/healthz', '/_ah/health'], (_req, res) => {
     server: 'ClinicasTrack Hybrid Backend',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    database: 'Google Cloud Firestore + Local SQLite Fast Mirror',
-    firestoreConfigured: isFirestoreConfigured(),
+    database: 'Supabase PostgreSQL + Local SQLite Fast Mirror',
+    supabaseConfigured: isSupabaseConfigured(),
   });
 });
 
-// Firebase Firestore Management APIs
-app.get('/api/firebase/status', (_req, res) => {
-  const statusInfo = getFirestoreStatusInfo();
-
+// Cloud Database (Supabase PostgreSQL) Management APIs
+const handleGetCloudStatus = (_req: express.Request, res: express.Response) => {
+  const statusInfo = getSupabaseStatusInfo();
   res.json({
     configured: statusInfo.configured,
-    projectId: statusInfo.projectId,
-    databaseId: statusInfo.databaseId,
+    provider: statusInfo.provider,
     status: statusInfo.status,
     circuitBreakerOpen: statusInfo.circuitBreakerOpen,
     lastSyncTimestamp: statusInfo.lastSyncTimestamp,
     lastSyncIso: statusInfo.lastSyncIso,
-    message: statusInfo.configured
-      ? `Firebase Firestore activo en ${statusInfo.projectId} con modo seguro y caché de baja latencia.`
-      : 'Firebase Firestore no configurado.',
+    message: statusInfo.message,
   });
-});
+};
 
-app.post('/api/firebase/sync', async (_req, res) => {
+const handleCloudSync = async (_req: express.Request, res: express.Response) => {
   try {
-    const result = await syncAllToFirestore();
+    const result = await syncAllToSupabase();
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ success: false, message: err?.message || 'Error sincronizando con Firestore' });
+    res.status(500).json({ success: false, message: err?.message || 'Error sincronizando con Supabase' });
   }
-});
+};
 
-app.post('/api/firebase/pull', async (req, res) => {
+const handleCloudPull = async (req: express.Request, res: express.Response) => {
   try {
     const forceFull = req.body?.forceFull === true;
-    const result = await pullFromFirestoreToCache(forceFull);
+    const result = await pullFromSupabaseToCache(forceFull);
     if (result.success && result.changed) {
       const snapshot = getAllDataSnapshot();
       broadcastChange('FULL_STATE_UPDATED', snapshot);
     }
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ success: false, message: err?.message || 'Error recuperando desde Firestore' });
+    res.status(500).json({ success: false, message: err?.message || 'Error recuperando desde Supabase' });
   }
-});
+};
 
-app.get('/api/firebase/diagnostics', async (_req, res) => {
+const handleCloudDiagnostics = async (_req: express.Request, res: express.Response) => {
   try {
-    const diag = await getFirestoreDiagnostics();
+    const diag = await getSupabaseDiagnostics();
     res.json(diag);
   } catch (err: any) {
-    res.status(500).json({ success: false, message: err?.message || 'Error ejecutando diagnóstico de Firestore' });
+    res.status(500).json({ success: false, message: err?.message || 'Error ejecutando diagnóstico de Supabase' });
   }
-});
+};
 
-// Main sync endpoint (Serves directly from SQLite at 0ms)
-app.get('/api/sync', (_req, res) => {
-  const snapshot = getAllDataSnapshot();
+const handleRetryOutbox = async (_req: express.Request, res: express.Response) => {
+  try {
+    const result = await processPendingCloudSyncQueue();
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err?.message || 'Error procesando cola Outbox' });
+  }
+};
+
+const handleDeltaSync = async (req: express.Request, res: express.Response) => {
+  try {
+    const daysBack = req.body?.attendanceDaysBack ? Number(req.body.attendanceDaysBack) : 7;
+    const result = await performDeltaSyncFromSupabase({ attendanceDaysBack: daysBack });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err?.message || 'Error ejecutando Delta Sync' });
+  }
+};
+
+app.get('/api/supabase/status', handleGetCloudStatus);
+app.post('/api/supabase/sync', handleCloudSync);
+app.post('/api/supabase/pull', handleCloudPull);
+app.post('/api/supabase/delta-sync', handleDeltaSync);
+app.get('/api/supabase/diagnostics', handleCloudDiagnostics);
+app.post('/api/supabase/retry-outbox', handleRetryOutbox);
+
+// Main sync endpoint: optimized relational responses per role (cuts egress & memory)
+app.get('/api/sync', async (req, res) => {
+  const { role, matricula, studentId, limit } = req.query;
+
+  // 1. Student Portal: strictly read ONLY the lines corresponding to the student's matricula
+  if (role === 'student' && (matricula || studentId)) {
+    const cleanMat = String(matricula || studentId).trim();
+    // If student is not yet in cache and Supabase is active, pull profile using indexed lookup
+    let student = getStudentByMatriculaOrIdFromDb(cleanMat);
+    if (!student && isSupabaseHealthy()) {
+      student = await getStudentFromSupabaseRelational(cleanMat);
+    }
+    // Pull student's own attendance records (from SQLite cache or Supabase index)
+    const snapshot = getStudentDataSnapshot(cleanMat);
+    if (snapshot.records.length === 0 && isSupabaseHealthy()) {
+      const cloudRecs = await getStudentRecordsFromSupabaseRelational(cleanMat, { limit: 150 });
+      if (cloudRecs.length > 0) {
+        snapshot.records = cloudRecs;
+      }
+    }
+    return res.json(snapshot);
+  }
+
+  // 2. Guest login screen: 0 attendance records sent
+  if (role === 'guest') {
+    const snapshot = getGuestDataSnapshot();
+    return res.json(snapshot);
+  }
+
+  // 3. Teacher Dashboard: bounded record limit for high performance and minimal Egress
+  const recLimit = limit ? Number(limit) : 250;
+  const snapshot = getTeacherDataSnapshot(recLimit);
   res.json(snapshot);
 });
 
@@ -233,7 +279,7 @@ app.post('/api/upload-state', (req, res) => {
     persistDatabase(true);
     const snapshot = getAllDataSnapshot();
     broadcastChange('FULL_STATE_UPDATED', snapshot);
-    syncAllToFirestore().catch((err) => console.warn('Upload-state firestore sync notice:', err));
+    syncAllToSupabase().catch((err) => console.warn('Upload-state supabase sync notice:', err));
 
     res.json({
       success: true,
@@ -308,15 +354,11 @@ app.post('/api/students', (req, res) => {
     const savedList = saveMultipleStudentsToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
-    syncMultipleStudentsToFirestore(savedList).catch((err) =>
-      console.warn('Students batch granular sync notice:', err)
-    );
     return res.json({ success: true, count: savedList.length, students: updatedList });
   } else if (body && typeof body === 'object') {
     const saved = saveStudentToDb(body);
     const updatedList = getStudentsFromDb();
     broadcastChange('STUDENTS_UPDATED', updatedList);
-    syncStudentToFirestore(saved).catch((err) => console.warn('Student granular sync notice:', err));
     return res.json({ success: true, student: saved, students: updatedList });
   }
   res.status(400).json({ success: false, message: 'Invalid payload' });
@@ -328,7 +370,6 @@ app.put('/api/students/:id', (req, res) => {
   const saved = saveStudentToDb({ ...body, id });
   if (saved) {
     broadcastChange('STUDENT_UPDATED', saved);
-    syncStudentToFirestore(saved).catch((err) => console.warn('Student update granular sync notice:', err));
     res.json({ success: true, student: saved });
   } else {
     res.status(404).json({ success: false, message: 'Student not found' });
@@ -340,7 +381,6 @@ app.delete('/api/students/:id', (req, res) => {
   const deleted = deleteStudentFromDb(id);
   if (deleted) {
     broadcastChange('STUDENT_DELETED', { id });
-    deleteStudentFromFirestore(id).catch((err) => console.warn('Student delete granular sync notice:', err));
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, message: 'Student not found' });
@@ -357,7 +397,6 @@ app.post('/api/students/link-device', (req, res) => {
   const updated = linkStudentDeviceInDb(studentId, matricula, deviceId, deviceName);
   if (updated) {
     broadcastChange('DEVICE_LINKED', updated);
-    syncStudentToFirestore(updated).catch((err) => console.warn('Device link granular sync notice:', err));
     return res.json({ success: true, student: updated });
   }
   res.status(404).json({ success: false, message: 'Student not found for device link' });
@@ -368,10 +407,6 @@ app.post('/api/students/unlink-device', (req, res) => {
   const unlinked = unlinkStudentDeviceInDb(studentId, matricula);
   if (unlinked) {
     broadcastChange('DEVICE_UNLINKED', { studentId, matricula });
-    const student = getStudentByMatriculaOrIdFromDb(studentId || matricula);
-    if (student) {
-      syncStudentToFirestore(student).catch((err) => console.warn('Device unlink granular sync notice:', err));
-    }
     return res.json({ success: true });
   }
   res.status(404).json({ success: false, message: 'Student not found' });
@@ -381,7 +416,6 @@ app.post('/api/students/unlink-all-devices', (_req, res) => {
   const count = unlinkAllDevicesInDb();
   const students = getStudentsFromDb();
   broadcastChange('STUDENTS_UPDATED', students);
-  syncMultipleStudentsToFirestore(students).catch((err) => console.warn('Unlink all granular sync notice:', err));
   res.json({ success: true, unlinkedCount: count, totalStudents: students.length });
 });
 
@@ -465,17 +499,27 @@ app.get('/api/students/:identifier/records', async (req, res) => {
   const { identifier } = req.params;
   const { startDate, endDate, limit, fetchFromCloud } = req.query;
 
-  const student = getStudentByMatriculaOrIdFromDb(identifier);
+  let student = getStudentByMatriculaOrIdFromDb(identifier);
+  if (!student && isSupabaseHealthy()) {
+    student = await getStudentFromSupabaseRelational(identifier);
+  }
+
   if (!student) {
     return res.status(404).json({ success: false, message: 'Student not found' });
   }
 
-  // On demand: If requested (e.g. for generating individual reports or historical audit), fetch only this student's records from Firestore
-  if (fetchFromCloud === 'true' && isFirestoreConfigured()) {
+  if (fetchFromCloud === 'true' && isSupabaseHealthy()) {
     try {
-      await fetchStudentRecordsFromFirestore(student.matricula);
+      const remote = await getStudentRecordsFromSupabaseRelational(student.matricula, {
+        startDate: startDate ? String(startDate) : undefined,
+        endDate: endDate ? String(endDate) : undefined,
+        limit: limit ? Number(limit) : 250,
+      });
+      if (remote && remote.length > 0) {
+        return res.json(remote);
+      }
     } catch (err) {
-      console.warn('Notice fetching student cloud records:', err);
+      console.warn('Supabase fetch records notice:', err);
     }
   }
 
@@ -489,9 +533,19 @@ app.get('/api/students/:identifier/records', async (req, res) => {
   res.json(records);
 });
 
-// High-speed direct SQL aggregate stats for teacher dashboard
-app.get('/api/attendance-stats', (req, res) => {
-  const { startDate, endDate, grupo } = req.query;
+// High-speed direct SQL aggregate stats for teacher dashboard (uses Supabase relational SQL GROUP BY if requested)
+app.get('/api/attendance-stats', async (req, res) => {
+  const { startDate, endDate, grupo, useCloud } = req.query;
+
+  if (useCloud === 'true' && isSupabaseHealthy()) {
+    const cloudStats = await getAttendanceStatsFromSupabaseRelational(
+      startDate ? String(startDate) : undefined,
+      endDate ? String(endDate) : undefined,
+      grupo ? String(grupo) : undefined
+    );
+    if (cloudStats) return res.json(cloudStats);
+  }
+
   const stats = getAttendanceStatsFromDb(
     startDate ? String(startDate) : undefined,
     endDate ? String(endDate) : undefined,
@@ -516,7 +570,6 @@ app.post('/api/records', (req, res) => {
     });
     const all = getRecordsFromDb();
     broadcastChange('RECORDS_UPDATED', all);
-    syncMultipleRecordsToFirestore(savedList).catch((err) => console.warn('Records batch sync notice:', err));
     return res.json({ success: true, count: all.length, records: all });
   }
 
@@ -526,7 +579,6 @@ app.post('/api/records', (req, res) => {
 
   const saved = saveRecordToDb(body);
   broadcastChange('RECORD_SAVED', saved);
-  syncRecordToFirestore(saved).catch((err) => console.warn('Record granular sync notice:', err));
   res.json({ success: true, record: saved });
 });
 
@@ -535,7 +587,6 @@ app.delete('/api/records/:id', (req, res) => {
   const deleted = deleteRecordFromDb(id);
   if (deleted) {
     broadcastChange('RECORD_DELETED', { id });
-    deleteRecordFromFirestore(id).catch((err) => console.warn('Record delete granular sync notice:', err));
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, message: 'Record not found' });
@@ -552,7 +603,6 @@ app.post('/api/sites', (req, res) => {
   if (Array.isArray(sites)) {
     sites.forEach((s) => {
       saveSiteToDb(s);
-      syncSiteToFirestore(s).catch((err) => console.warn('Site granular sync notice:', err));
     });
     const allSites = getSitesFromDb();
     broadcastChange('SITES_UPDATED', allSites);
@@ -567,7 +617,6 @@ app.delete('/api/sites/:id', (req, res) => {
   if (deleted) {
     const allSites = getSitesFromDb();
     broadcastChange('SITES_UPDATED', allSites);
-    deleteSiteFromFirestore(id).catch((err) => console.warn('Site delete granular sync notice:', err));
     return res.json({ success: true, sites: allSites });
   }
   res.status(404).json({ success: false, message: 'Site not found' });
@@ -579,7 +628,6 @@ app.post('/api/hospital', (req, res) => {
     setSystemConfig('hospitalZone', zone);
     persistDatabase();
     broadcastChange('HOSPITAL_UPDATED', zone);
-    syncConfigToFirestore('hospitalZone', zone).catch((err) => console.warn('Hospital zone granular sync notice:', err));
     return res.json({ success: true, hospitalZone: zone });
   }
   res.status(400).json({ success: false, message: 'Invalid hospital zone' });
@@ -591,7 +639,6 @@ app.post('/api/master', (req, res) => {
     setSystemConfig('masterConfig', config);
     persistDatabase();
     broadcastChange('MASTER_UPDATED', config);
-    syncConfigToFirestore('masterConfig', config).catch((err) => console.warn('Master config granular sync notice:', err));
     return res.json({ success: true, masterConfig: config });
   }
   res.status(400).json({ success: false, message: 'Invalid master config' });
@@ -606,7 +653,6 @@ app.post('/api/holidays', (req, res) => {
   if (Array.isArray(holidays)) {
     holidays.forEach((h) => {
       saveHolidayToDb(h);
-      syncHolidayToFirestore(h).catch((err) => console.warn('Holiday granular sync notice:', err));
     });
     const allHols = getHolidaysFromDb();
     broadcastChange('HOLIDAYS_UPDATED', allHols);
@@ -620,7 +666,6 @@ app.delete('/api/holidays/:fecha', (req, res) => {
   deleteHolidayFromDb(fecha);
   const allHols = getHolidaysFromDb();
   broadcastChange('HOLIDAYS_UPDATED', allHols);
-  deleteHolidayFromFirestore(fecha).catch((err) => console.warn('Holiday delete granular sync notice:', err));
   res.json({ success: true, holidays: allHols });
 });
 
@@ -687,19 +732,10 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 ClinicasTrack Server running on http://0.0.0.0:${PORT}`);
-    if (isFirestoreConfigured()) {
-      try {
-        const checkRes = await reconcileStartupFromFirestore();
-        if (checkRes.success) {
-          console.log(`✅ ${checkRes.message}`);
-        } else {
-          console.warn('⚠️ Nota sobre reconciliación de arranque:', checkRes.message);
-        }
-      } catch (checkErr) {
-        console.warn('⚠️ Error no fatal al verificar Firestore en arranque:', checkErr);
-      }
+    if (isSupabaseConfigured()) {
+      console.log('✅ Supabase PostgreSQL activo como espejo en la nube + SQLite Local.');
     } else {
-      console.log('⚡ Local-first SQLite & in-memory cache ready (Firestore no configurado).');
+      console.log('⚡ Local-first SQLite & in-memory cache ready.');
     }
   });
 }

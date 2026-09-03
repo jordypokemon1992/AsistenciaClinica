@@ -1,8 +1,8 @@
-import { pgTable, serial, text, integer, doublePrecision, timestamp } from 'drizzle-orm/pg-core';
+import { pgTable, serial, text, integer, doublePrecision, timestamp, index } from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
-  uid: text('uid').notNull().unique(), // Firebase Auth UID
+  uid: text('uid').notNull().unique(), // User Auth UID
   email: text('email').notNull(),
   role: text('role').default('docente'),
   createdAt: timestamp('created_at').defaultNow(),
@@ -52,7 +52,12 @@ export const students = pgTable('students', {
   linkedAt: text('linked_at'),
   dataJson: text('data_json'),
   updatedAt: text('updated_at').notNull(),
-});
+}, (table) => [
+  index('idx_students_matricula').on(table.matricula),
+  index('idx_students_grupo').on(table.grupo),
+  index('idx_students_activo').on(table.activo),
+  index('idx_students_sede_id').on(table.sedeId),
+]);
 
 export const attendanceRecords = pgTable('attendance_records', {
   id: text('id').primaryKey(),
@@ -82,7 +87,14 @@ export const attendanceRecords = pgTable('attendance_records', {
   motivoJustificante: text('motivo_justificante'),
   dataJson: text('data_json'),
   createdAt: text('created_at').notNull(),
-});
+}, (table) => [
+  index('idx_records_matricula').on(table.matricula),
+  index('idx_records_matricula_fecha').on(table.matricula, table.fecha),
+  index('idx_records_fecha').on(table.fecha),
+  index('idx_records_estado').on(table.estado),
+  index('idx_records_grupo').on(table.grupo),
+  index('idx_records_site_id').on(table.siteId),
+]);
 
 export const holidays = pgTable('holidays', {
   fecha: text('fecha').primaryKey(),

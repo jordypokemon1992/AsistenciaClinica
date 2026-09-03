@@ -19,7 +19,6 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/data ./data
 COPY --from=builder /app/app_state.json* ./
-COPY --from=builder /app/firebase-applet-config.json* ./
 
 EXPOSE 8080
 

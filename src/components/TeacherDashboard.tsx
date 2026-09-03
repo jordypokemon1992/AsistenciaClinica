@@ -149,27 +149,26 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   const [isImportingBackup, setIsImportingBackup] = useState(false);
   const [backupStatus, setBackupStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // Firebase Firestore Sync State & Retention Policies
-  const [firebaseStatus, setFirebaseStatus] = useState<{
+  // Supabase PostgreSQL Cloud Sync State & Retention Policies
+  const [supabaseStatus, setSupabaseStatus] = useState<{
     configured: boolean;
-    projectId: string | null;
-    databaseId?: string | null;
+    provider?: string;
+    projectId?: string | null;
     status?: string;
     circuitBreakerOpen?: boolean;
     lastSyncTimestamp?: number;
     lastSyncIso?: string | null;
     message: string;
   } | null>(null);
-  const [isSyncingFirebase, setIsSyncingFirebase] = useState(false);
-  const [firebaseSyncResult, setFirebaseSyncResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [isSyncingSupabase, setIsSyncingSupabase] = useState(false);
+  const [supabaseSyncResult, setSupabaseSyncResult] = useState<{ success: boolean; message: string } | null>(null);
   const [isPurgingRecords, setIsPurgingRecords] = useState(false);
   const [purgeRetentionDays, setPurgeRetentionDays] = useState<number>(60);
   const [purgeResult, setPurgeResult] = useState<{ success: boolean; message: string } | null>(null);
 
-  const [firebaseDiagnostics, setFirebaseDiagnostics] = useState<{
+  const [supabaseDiagnostics, setSupabaseDiagnostics] = useState<{
     configured: boolean;
-    projectId: string | null;
-    databaseId: string | null;
+    provider: string;
     status: string;
     circuitBreakerOpen: boolean;
     lastSyncTimestamp: number;
@@ -182,7 +181,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
       sites: number;
       holidays: number;
     };
-    firestoreCounts?: {
+    supabaseCounts?: {
       students: number;
       records: number;
       sites: number;
@@ -191,98 +190,128 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   } | null>(null);
   const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState(false);
 
-  const fetchFirebaseDiagnostics = useCallback(async () => {
+  const fetchSupabaseDiagnostics = useCallback(async () => {
     setIsLoadingDiagnostics(true);
     try {
-      const res = await fetch('/api/firebase/diagnostics');
+      const res = await fetch('/api/supabase/diagnostics');
       if (res.ok) {
         const data = await res.json();
-        setFirebaseDiagnostics(data);
+        setSupabaseDiagnostics(data);
       }
     } catch (err) {
-      console.warn('Firebase diagnostics fetch error:', err);
+      console.warn('Supabase diagnostics fetch error:', err);
     } finally {
       setIsLoadingDiagnostics(false);
     }
   }, []);
 
-  const fetchFirebaseStatus = useCallback(async () => {
+  const fetchSupabaseStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/firebase/status');
+      const res = await fetch('/api/supabase/status');
       if (res.ok) {
         const data = await res.json();
-        setFirebaseStatus(data);
+        setSupabaseStatus(data);
       }
     } catch {}
   }, []);
 
   useEffect(() => {
-    fetchFirebaseStatus();
+    fetchSupabaseStatus();
     if (activeTab === 'CONFIG') {
-      fetchFirebaseDiagnostics();
+      fetchSupabaseDiagnostics();
     }
-  }, [fetchFirebaseStatus, fetchFirebaseDiagnostics, activeTab]);
+  }, [fetchSupabaseStatus, fetchSupabaseDiagnostics, activeTab]);
 
-  const handleSyncToFirebase = async () => {
+  const handleSyncToSupabase = async () => {
     const confirmed = window.confirm(
-      '⚠️ ¿Deseas ejecutar un Respaldo Total a Google Firestore?\n\nNota: La aplicación ya cuenta con "Write-Through" automático en vivo (cada checada o edición individual se guarda sola en Firestore sin coste excesivo).\n\nUsa esta sincronización completa solo si deseas respaldar o sobrescribir masivamente todas las colecciones.'
+      '⚠️ ¿Deseas sincronizar todos los datos locales a Supabase PostgreSQL?\n\nEsta acción respaldará todas las tablas (alumnos, checadas, sedes, días inhábiles) en tu base de datos Supabase en la nube.'
     );
     if (!confirmed) return;
 
-    setIsSyncingFirebase(true);
-    setFirebaseSyncResult(null);
+    setIsSyncingSupabase(true);
+    setSupabaseSyncResult(null);
     try {
-      const res = await fetch('/api/firebase/sync', { method: 'POST' });
+      const res = await fetch('/api/supabase/sync', { method: 'POST' });
       const data = await res.json();
-      setFirebaseSyncResult({
+      setSupabaseSyncResult({
         success: data.success,
         message: data.message,
       });
-      fetchFirebaseStatus();
-      fetchFirebaseDiagnostics();
+      fetchSupabaseStatus();
+      fetchSupabaseDiagnostics();
     } catch (err: any) {
-      setFirebaseSyncResult({
+      setSupabaseSyncResult({
         success: false,
-        message: `Error al sincronizar con Firebase: ${err.message}`,
+        message: `Error al sincronizar con Supabase: ${err.message}`,
       });
     } finally {
-      setIsSyncingFirebase(false);
-      setTimeout(() => setFirebaseSyncResult(null), 8000);
+      setIsSyncingSupabase(false);
+      setTimeout(() => setSupabaseSyncResult(null), 8000);
     }
   };
 
-  const handlePullFromFirebase = async (forceFull = false) => {
+  const handlePullFromSupabase = async (forceFull = false) => {
     const confirmed = window.confirm(
-      '⚠️ ¿Deseas descargar y sobrescribir los datos locales desde Firestore?\n\nEsta acción leerá todas las colecciones desde Firestore y actualizará la base de datos local SQLite clinicas.db.\n\n¿Continuar con la restauración?'
+      '⚠️ ¿Deseas descargar y sobrescribir los datos locales desde Supabase?\n\nEsta acción leerá las tablas desde Supabase PostgreSQL y actualizará la base de datos local SQLite clinicas.db.\n\n¿Continuar con la restauración?'
     );
     if (!confirmed) return;
 
-    setIsSyncingFirebase(true);
-    setFirebaseSyncResult(null);
+    setIsSyncingSupabase(true);
+    setSupabaseSyncResult(null);
     try {
-      const res = await fetch('/api/firebase/pull', {
+      const res = await fetch('/api/supabase/pull', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ forceFull }),
       });
       const data = await res.json();
-      setFirebaseSyncResult({
+      setSupabaseSyncResult({
         success: data.success,
         message: data.message,
       });
       if (data.success) {
         onRefreshData();
       }
-      fetchFirebaseStatus();
-      fetchFirebaseDiagnostics();
+      fetchSupabaseStatus();
+      fetchSupabaseDiagnostics();
     } catch (err: any) {
-      setFirebaseSyncResult({
+      setSupabaseSyncResult({
         success: false,
-        message: `Error al descargar desde Firebase: ${err.message}`,
+        message: `Error al descargar desde Supabase: ${err.message}`,
       });
     } finally {
-      setIsSyncingFirebase(false);
-      setTimeout(() => setFirebaseSyncResult(null), 8000);
+      setIsSyncingSupabase(false);
+      setTimeout(() => setSupabaseSyncResult(null), 8000);
+    }
+  };
+
+  const handleDeltaSyncFromSupabase = async () => {
+    setIsSyncingSupabase(true);
+    setSupabaseSyncResult(null);
+    try {
+      const res = await fetch('/api/supabase/delta-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attendanceDaysBack: 7 }),
+      });
+      const data = await res.json();
+      setSupabaseSyncResult({
+        success: data.success,
+        message: data.message,
+      });
+      if (data.success) {
+        onRefreshData();
+      }
+      fetchSupabaseStatus();
+      fetchSupabaseDiagnostics();
+    } catch (err: any) {
+      setSupabaseSyncResult({
+        success: false,
+        message: `Error en Delta Sync: ${err.message}`,
+      });
+    } finally {
+      setIsSyncingSupabase(false);
+      setTimeout(() => setSupabaseSyncResult(null), 8000);
     }
   };
 
@@ -3503,37 +3532,37 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
               </div>
             </div>
 
-            {/* Recuadro Firebase Firestore: Base de Datos Maestra Nativa en la Nube */}
-            <div className="lg:col-span-12 bg-gradient-to-br from-indigo-950 via-slate-900 to-blue-950 text-white rounded-3xl p-6 sm:p-8 border border-blue-500/30 shadow-xl space-y-6">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-blue-500/20 pb-5">
+            {/* Recuadro Supabase PostgreSQL: Base de Datos Maestra en la Nube */}
+            <div className="lg:col-span-12 bg-gradient-to-br from-emerald-950 via-slate-900 to-teal-950 text-white rounded-3xl p-6 sm:p-8 border border-emerald-500/30 shadow-xl space-y-6">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-emerald-500/20 pb-5">
                 <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-2xl bg-blue-500/20 border border-blue-400/40 flex items-center justify-center text-blue-400 shadow-inner">
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-500/20 border border-emerald-400/40 flex items-center justify-center text-emerald-400 shadow-inner">
                     <Database className="w-6 h-6" />
                   </div>
                   <div>
                     <div className="flex items-center gap-2.5 flex-wrap">
                       <h3 className="font-extrabold text-white text-base sm:text-lg">
-                        Google Cloud Firebase Firestore (Base Maestra en la Nube)
+                        Supabase PostgreSQL (Base Maestra en la Nube)
                       </h3>
                       <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
-                        firebaseStatus?.configured
-                          ? 'bg-blue-500 text-white shadow-sm'
+                        supabaseStatus?.configured
+                          ? 'bg-emerald-500 text-white shadow-sm'
                           : 'bg-amber-400/20 text-amber-300 border border-amber-400/30'
                       }`}>
-                        {firebaseStatus?.configured ? '⚡ Firestore Maestra Activa ($0.00 Coste)' : '⚪ No Configurado'}
+                        {supabaseStatus?.configured ? '⚡ Supabase Activo (Espejo en la Nube)' : '⚪ No Configurado'}
                       </span>
-                      {firebaseStatus?.configured && (
+                      {supabaseStatus?.configured && (
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
-                          firebaseStatus.circuitBreakerOpen
+                          supabaseStatus.circuitBreakerOpen
                             ? 'bg-amber-500/20 text-amber-300 border-amber-400/30'
                             : 'bg-emerald-500/20 text-emerald-300 border-emerald-400/30'
                         }`}>
-                          🛡️ {firebaseStatus.circuitBreakerOpen ? 'Circuit Breaker Activo' : 'Conexión Segura Auto-escalable'}
+                          🛡️ {supabaseStatus.circuitBreakerOpen ? 'Circuit Breaker Activo' : 'PostgreSQL Pooling Directo'}
                         </span>
                       )}
                     </div>
                     <p className="text-xs text-slate-300 mt-0.5">
-                      Arquitectura <strong>Write-Through Granular</strong> activa: cada checada o edición escribe únicamente su documento individual en Firestore. Todas las lecturas y consultas de la app se resuelven instantáneamente desde SQLite a 0 lecturas remotas.
+                      Arquitectura <strong>Local-First con SQLite</strong>: todas las lecturas y consultas de la app se resuelven en microsegundos desde SQLite sin consumir ancho de banda (0 Egress). Supabase actúa como réplica relacional en la nube.
                     </p>
                   </div>
                 </div>
@@ -3541,59 +3570,70 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={handleSyncToFirebase}
-                    disabled={isSyncingFirebase}
-                    className="px-3.5 py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-xs shadow-md transition-all flex items-center gap-1.5 disabled:opacity-50"
+                    onClick={handleDeltaSyncFromSupabase}
+                    disabled={isSyncingSupabase}
+                    className="px-3.5 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl text-xs shadow-md transition-all flex items-center gap-1.5 disabled:opacity-50"
+                    title="Delta Sync inteligente: actualiza cambios de alumnos/sedes y checadas recientes consumiendo kilobytes en lugar de megabytes"
                   >
-                    <RefreshCw className={`w-4 h-4 ${isSyncingFirebase ? 'animate-spin text-white' : ''}`} />
-                    <span>{isSyncingFirebase ? 'Sincronizando...' : 'Subir a Firestore (Push)'}</span>
+                    <RefreshCw className={`w-4 h-4 ${isSyncingSupabase ? 'animate-spin text-white' : ''}`} />
+                    <span>Delta Sync (Bajo Egress)</span>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => handlePullFromFirebase(false)}
-                    disabled={isSyncingFirebase}
-                    className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-blue-300 border border-blue-500/40 font-bold rounded-xl text-xs transition-all flex items-center gap-1.5 disabled:opacity-50"
-                    title="Descargar datos maestros desde Firestore"
+                    onClick={handleSyncToSupabase}
+                    disabled={isSyncingSupabase}
+                    className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs shadow-md transition-all flex items-center gap-1.5 disabled:opacity-50"
                   >
-                    <Database className="w-4 h-4 text-blue-400" />
-                    <span>Descargar de Firestore (Pull)</span>
+                    <RefreshCw className={`w-4 h-4 ${isSyncingSupabase ? 'animate-spin text-white' : ''}`} />
+                    <span>{isSyncingSupabase ? 'Sincronizando...' : 'Subir a Supabase (Push)'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handlePullFromSupabase(false)}
+                    disabled={isSyncingSupabase}
+                    className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/40 font-bold rounded-xl text-xs transition-all flex items-center gap-1.5 disabled:opacity-50"
+                    title="Descargar datos maestros desde Supabase"
+                  >
+                    <Database className="w-4 h-4 text-emerald-400" />
+                    <span>Descargar de Supabase (Pull)</span>
                   </button>
                 </div>
               </div>
 
               {/* Status & Sync Result Message */}
-              {firebaseSyncResult && (
+              {supabaseSyncResult && (
                 <div className={`p-4 rounded-2xl text-xs font-semibold flex items-center gap-3 ${
-                  firebaseSyncResult.success
-                    ? 'bg-blue-500/20 text-blue-200 border border-blue-400/30'
+                  supabaseSyncResult.success
+                    ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/30'
                     : 'bg-rose-500/20 text-rose-200 border border-rose-400/30'
                 }`}>
-                  {firebaseSyncResult.success ? (
-                    <CheckCircle2 className="w-5 h-5 text-blue-400 shrink-0" />
+                  {supabaseSyncResult.success ? (
+                    <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
                   ) : (
                     <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
                   )}
-                  <span>{firebaseSyncResult.message}</span>
+                  <span>{supabaseSyncResult.message}</span>
                 </div>
               )}
 
-              {/* Diagnóstico en Vivo de Colecciones Firestore vs SQLite Local */}
+              {/* Diagnóstico en Vivo de Tablas Supabase vs SQLite Local */}
               <div className="bg-slate-900/90 rounded-2xl p-4 border border-slate-800 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-blue-400" />
-                    <h4 className="text-xs font-bold text-blue-300">
-                      Estado y Recuento en Firestore Maestra vs Caché Local SQLite
+                    <Activity className="w-4 h-4 text-emerald-400" />
+                    <h4 className="text-xs font-bold text-emerald-300">
+                      Estado y Recuento en Supabase PostgreSQL vs Caché Local SQLite
                     </h4>
                   </div>
                   <button
                     type="button"
-                    onClick={() => fetchFirebaseDiagnostics()}
+                    onClick={() => fetchSupabaseDiagnostics()}
                     disabled={isLoadingDiagnostics}
                     className="text-[11px] px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg border border-slate-700 flex items-center gap-1.5 transition-colors disabled:opacity-50"
                   >
-                    <RefreshCw className={`w-3 h-3 ${isLoadingDiagnostics ? 'animate-spin text-blue-400' : ''}`} />
+                    <RefreshCw className={`w-3 h-3 ${isLoadingDiagnostics ? 'animate-spin text-emerald-400' : ''}`} />
                     <span>{isLoadingDiagnostics ? 'Comprobando...' : 'Revisar Estado'}</span>
                   </button>
                 </div>
@@ -3603,13 +3643,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                     <span className="block text-slate-400 text-[10px] font-bold uppercase">Alumnos (students)</span>
                     <div className="flex items-baseline gap-1.5 mt-0.5">
                       <span className="text-sm font-bold text-white">
-                        {firebaseDiagnostics?.firestoreCounts?.students ?? '—'}
+                        {supabaseDiagnostics?.supabaseCounts?.students ?? '—'}
                       </span>
                       <span className="text-[10px] text-slate-400 font-mono">
-                        / {firebaseDiagnostics?.localCounts?.students ?? students.length} local
+                        / {supabaseDiagnostics?.localCounts?.students ?? students.length} local
                       </span>
                     </div>
-                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
+                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                       ✓ Sincronizado
                     </span>
                   </div>
@@ -3618,13 +3658,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                     <span className="block text-slate-400 text-[10px] font-bold uppercase">Checadas (records)</span>
                     <div className="flex items-baseline gap-1.5 mt-0.5">
                       <span className="text-sm font-bold text-white">
-                        {firebaseDiagnostics?.firestoreCounts?.records ?? '—'}
+                        {supabaseDiagnostics?.supabaseCounts?.records ?? '—'}
                       </span>
                       <span className="text-[10px] text-slate-400 font-mono">
-                        / {firebaseDiagnostics?.localCounts?.records ?? attendanceRecords.length} local
+                        / {supabaseDiagnostics?.localCounts?.records ?? attendanceRecords.length} local
                       </span>
                     </div>
-                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
+                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                       ✓ Sincronizado
                     </span>
                   </div>
@@ -3633,13 +3673,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                     <span className="block text-slate-400 text-[10px] font-bold uppercase">Sedes (sites)</span>
                     <div className="flex items-baseline gap-1.5 mt-0.5">
                       <span className="text-sm font-bold text-white">
-                        {firebaseDiagnostics?.firestoreCounts?.sites ?? '—'}
+                        {supabaseDiagnostics?.supabaseCounts?.sites ?? '—'}
                       </span>
                       <span className="text-[10px] text-slate-400 font-mono">
-                        / {firebaseDiagnostics?.localCounts?.sites ?? getHospitalSites().length} local
+                        / {supabaseDiagnostics?.localCounts?.sites ?? getHospitalSites().length} local
                       </span>
                     </div>
-                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
+                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                       ✓ Sincronizado
                     </span>
                   </div>
@@ -3648,13 +3688,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                     <span className="block text-slate-400 text-[10px] font-bold uppercase">Inhábiles (holidays)</span>
                     <div className="flex items-baseline gap-1.5 mt-0.5">
                       <span className="text-sm font-bold text-white">
-                        {firebaseDiagnostics?.firestoreCounts?.holidays ?? '—'}
+                        {supabaseDiagnostics?.supabaseCounts?.holidays ?? '—'}
                       </span>
                       <span className="text-[10px] text-slate-400 font-mono">
-                        / {firebaseDiagnostics?.localCounts?.holidays ?? diasInhabiles.length} local
+                        / {supabaseDiagnostics?.localCounts?.holidays ?? diasInhabiles.length} local
                       </span>
                     </div>
-                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">
+                    <span className="inline-block mt-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                       ✓ Sincronizado
                     </span>
                   </div>
@@ -3663,43 +3703,43 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
               {/* Arquitectura & Ventajas */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                {/* 1. Serverless Auto-scale */}
+                {/* 1. Base Relacional PostgreSQL */}
                 <div className="p-4 bg-slate-900/90 rounded-2xl border border-slate-800 space-y-2 flex flex-col justify-between">
                   <div>
-                    <span className="text-[10px] font-black uppercase tracking-wider text-blue-400 flex items-center gap-1">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-emerald-400 flex items-center gap-1">
                       <Activity className="w-3.5 h-3.5" />
-                      1. Auto-Escalable Nativo
+                      1. PostgreSQL Relacional
                     </span>
                     <p className="text-slate-300 leading-relaxed mt-1 text-[11px]">
-                      Sin servidores virtuales o contenedores PostgREST que puedan pausarse o saturar memoria RAM.
+                      Tablas estructuradas con índices para alumnos, matrículas, turnos de guardia y asistencias.
                     </p>
                   </div>
-                  <span className="text-[10px] font-mono text-emerald-400 font-bold">100% Uptime Garantizado</span>
+                  <span className="text-[10px] font-mono text-emerald-400 font-bold">Supabase Cloud</span>
                 </div>
 
-                {/* 2. Zero-Cost Free Tier */}
+                {/* 2. Cero Egress / Lecturas Innecesarias */}
                 <div className="p-4 bg-slate-900/90 rounded-2xl border border-slate-800 space-y-2 flex flex-col justify-between">
                   <div>
                     <span className="text-[10px] font-black uppercase tracking-wider text-teal-400 flex items-center gap-1">
                       <Radio className="w-3.5 h-3.5" />
-                      2. Cuota Gratuita Amplia
+                      2. Cero Consumo de Egress
                     </span>
                     <p className="text-slate-300 leading-relaxed mt-1 text-[11px]">
-                      50,000 lecturas y 20,000 escrituras al día sin coste alguno. Más de 10x lo requerido para la operación de la clínica.
+                      Las lecturas de alumnos y checadas se atienden desde SQLite local, protegiendo los límites de transferencia.
                     </p>
                   </div>
-                  <span className="text-[10px] font-mono text-teal-300 font-bold">$0.00 / mes</span>
+                  <span className="text-[10px] font-mono text-teal-300 font-bold">0 MB Egress en Consultas</span>
                 </div>
 
-                {/* 3. Anti Retry-Storm Protection */}
+                {/* 3. Anti-Saturación y Respaldo Seguro */}
                 <div className="p-4 bg-slate-900/90 rounded-2xl border border-slate-800 space-y-2 flex flex-col justify-between">
                   <div>
                     <span className="text-[10px] font-black uppercase tracking-wider text-indigo-400 flex items-center gap-1">
                       <Trash2 className="w-3.5 h-3.5" />
-                      3. Circuit Breaker & Agrupación
+                      3. Conexión Protegida
                     </span>
                     <p className="text-slate-300 leading-relaxed mt-1 text-[11px]">
-                      Las peticiones se ejecutan en transacciones por lotes (batches) de hasta 400 elementos con salvaguardas de reintentos exponenciales.
+                      Pool de conexiones optimizado con reintentos controlados y circuit breaker ante saturación.
                     </p>
                   </div>
                   <span className="text-[10px] font-mono text-indigo-300 font-bold">Protección Activa</span>
