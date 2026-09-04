@@ -162,6 +162,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   } | null>(null);
   const [isSyncingSupabase, setIsSyncingSupabase] = useState(false);
   const [supabaseSyncResult, setSupabaseSyncResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [showCloudRunHelp, setShowCloudRunHelp] = useState(false);
   const [isPurgingRecords, setIsPurgingRecords] = useState(false);
   const [purgeRetentionDays, setPurgeRetentionDays] = useState<number>(60);
   const [purgeResult, setPurgeResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -3551,6 +3552,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                       }`}>
                         {supabaseStatus?.configured ? '⚡ Supabase Activo (Espejo en la Nube)' : '⚪ No Configurado'}
                       </span>
+                      {!supabaseStatus?.configured && (
+                        <button
+                          type="button"
+                          onClick={() => setShowCloudRunHelp(!showCloudRunHelp)}
+                          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition-all flex items-center gap-1"
+                        >
+                          <span>{showCloudRunHelp ? 'Ocultar Guía' : '¿Cómo configurar en Cloud Run?'}</span>
+                        </button>
+                      )}
                       {supabaseStatus?.configured && (
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
                           supabaseStatus.circuitBreakerOpen
@@ -3604,17 +3614,69 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
               {/* Status & Sync Result Message */}
               {supabaseSyncResult && (
-                <div className={`p-4 rounded-2xl text-xs font-semibold flex items-center gap-3 ${
+                <div className={`p-4 rounded-2xl text-xs font-semibold flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
                   supabaseSyncResult.success
                     ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/30'
                     : 'bg-rose-500/20 text-rose-200 border border-rose-400/30'
                 }`}>
-                  {supabaseSyncResult.success ? (
-                    <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-                  ) : (
-                    <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
+                  <div className="flex items-center gap-3">
+                    {supabaseSyncResult.success ? (
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0" />
+                    )}
+                    <span>{supabaseSyncResult.message}</span>
+                  </div>
+                  {!supabaseStatus?.configured && (
+                    <button
+                      type="button"
+                      onClick={() => setShowCloudRunHelp(true)}
+                      className="px-3 py-1.5 bg-rose-400/20 hover:bg-rose-400/30 text-rose-100 rounded-lg text-[11px] font-bold border border-rose-400/40 shrink-0 transition-colors"
+                    >
+                      Ver cómo configurar en Cloud Run ⚙️
+                    </button>
                   )}
-                  <span>{supabaseSyncResult.message}</span>
+                </div>
+              )}
+
+              {/* Guía Desplegable para Conectar Supabase en Cloud Run */}
+              {showCloudRunHelp && (
+                <div className="bg-slate-900/95 border border-amber-500/40 rounded-2xl p-5 text-xs text-slate-200 space-y-4 shadow-2xl animate-in fade-in duration-200">
+                  <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                    <div className="flex items-center gap-2 text-amber-300 font-bold text-sm">
+                      <Settings className="w-4 h-4" />
+                      <span>Cómo activar la conexión de Supabase en Google Cloud Run</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowCloudRunHelp(false)}
+                      className="text-slate-400 hover:text-white px-2 py-0.5 rounded text-[11px]"
+                    >
+                      ✕ Cerrar
+                    </button>
+                  </div>
+
+                  <p className="text-slate-300 leading-relaxed">
+                    La app funciona <strong>100% de forma autónoma con SQLite local</strong> (357 alumnos y todas tus checadas). El estado <span className="text-amber-300 font-bold">No Configurado</span> aparece únicamente porque el contenedor en Cloud Run requiere la variable de conexión a tu base de datos Supabase:
+                  </p>
+
+                  <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 font-mono text-[11px] space-y-2">
+                    <div className="text-slate-400 font-sans font-bold text-[10px] uppercase">Variable de Entorno requerida en Cloud Run:</div>
+                    <div className="text-emerald-400 break-all select-all font-bold">DATABASE_URL</div>
+                    <div className="text-slate-400 font-sans text-[11px]">
+                      Formato de Supabase (Connection Pooling):
+                    </div>
+                    <div className="text-teal-300 break-all select-all bg-slate-900 p-2 rounded border border-slate-800">
+                      postgresql://postgres.[TU_PROYECTO]:[TU_CONTRASEÑA]@aws-0-[REGION].pooler.supabase.com:6543/postgres
+                    </div>
+                  </div>
+
+                  <ol className="list-decimal list-inside space-y-1.5 text-slate-300 text-[11px]">
+                    <li>En <strong>Supabase</strong> (supabase.com): Ve a <em>Project Settings &gt; Database &gt; Connection string (URI)</em> y copia la URL con tu contraseña.</li>
+                    <li>En <strong>Google Cloud Console</strong>: Ve a <em>Cloud Run &gt; clinicastrack &gt; Editar y desplegar nueva revisión</em>.</li>
+                    <li>En la pestaña <em>Variables y secretos</em> (o <em>Contenedores &gt; Variables de entorno</em>), añade la variable <code className="text-amber-300">DATABASE_URL</code> y pega la URL.</li>
+                    <li>Haz clic en <strong>Desplegar</strong>. En cuanto inicie, el indicador cambiará a <strong className="text-emerald-400">⚡ Supabase Activo</strong> automáticamente.</li>
+                  </ol>
                 </div>
               )}
 

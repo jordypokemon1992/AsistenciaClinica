@@ -9,7 +9,7 @@ declare global {
   var _postgresPool: Pool | null | undefined;
 }
 
-let cloudSqlHealthy: boolean = false;
+let cloudSqlHealthy: boolean = true;
 
 export const markCloudSqlUnavailable = (reason?: any) => {
   cloudSqlHealthy = false;
@@ -25,17 +25,28 @@ export const isCloudSqlHealthy = (): boolean => {
 
 function cleanConnectionString(urlStr?: string): string | undefined {
   if (!urlStr) return undefined;
-  const trimmed = urlStr.trim();
-  if (!trimmed) return undefined;
-  // If user pasted postgresql://user:[password]@host:5432/db, strip brackets from password
-  return trimmed.replace(/(:\/\/[^:]+:)?\[([^\]]+)\](@)/, '$1$2$3');
+  let cleaned = urlStr.trim();
+  if (!cleaned) return undefined;
+
+  // 1. If user pasted postgresql://user:[password]@host:5432/db, strip brackets from password
+  cleaned = cleaned.replace(/(:\/\/[^:]+:)?\[([^\]]+)\](@)/, '$1$2$3');
+
+  // 2. If user pasted direct Supabase URL (db.<ref>.supabase.co:5432) which is IPv6-only,
+  // rewrite to the IPv4-compatible Supabase connection pooler on port 6543
+  const directMatch = cleaned.match(/postgresql:\/\/([^:]+):([^@]+)@db\.([a-z0-9]+)\.supabase\.co(?::\d+)?\/(.*)/);
+  if (directMatch) {
+    const user = directMatch[1];
+    const pass = directMatch[2];
+    const projectRef = directMatch[3];
+    const dbName = directMatch[4] || 'postgres';
+    const poolerUser = user.includes('.') ? user : `${user}.${projectRef}`;
+    cleaned = `postgresql://${poolerUser}:${pass}@aws-0-us-east-1.pooler.supabase.com:6543/${dbName}`;
+  }
+
+  return cleaned;
 }
 
 export const isCloudSqlConfigured = (): boolean => {
-  if (cloudSqlHealthy === false) {
-    return false;
-  }
-
   const rawUrl = process.env.DATABASE_URL || process.env.SUPABASE_DATABASE_URL;
   if (rawUrl && rawUrl.trim().length > 0) {
     return true;
