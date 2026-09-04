@@ -723,8 +723,8 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({
               {[
                 { mat: '723053105', name: 'Airam Elena (HGLM)' },
                 { mat: '723053018', name: 'Edel Emilio (HGLM 7 A)' },
-                { mat: '20241001', name: 'Ana Sofia (Sede Principal)' },
-                { mat: '20241002', name: 'Carlos (IMSS Clínica)' },
+                { mat: '722053254', name: 'María Itzamna' },
+                { mat: '722053106', name: 'Brayan Josué' },
               ].map((s) => (
                 <button
                   key={s.mat}

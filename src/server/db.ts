@@ -9,7 +9,7 @@ import {
   systemConfig as pgSystemConfig,
   holidays as pgHolidays,
 } from '../db/schema.ts';
-import { eq, and, gte, lte, gt, sql, desc, asc } from 'drizzle-orm';
+import { eq, and, or, gte, lte, gt, sql, desc, asc } from 'drizzle-orm';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
@@ -1750,16 +1750,28 @@ export function saveMultipleStudentsToDb(studentsList: any[]): any[] {
 export function deleteStudentFromDb(studentId: string): boolean {
   if (!db || !studentId) return false;
   const clean = String(studentId).trim();
-  const stmt = db.prepare(`DELETE FROM students WHERE id = ? OR lower(trim(matricula)) = ?`);
-  stmt.run([clean, clean.toLowerCase()]);
-  stmt.free();
+  const lower = clean.toLowerCase();
+
+  // Find student first to know matricula and id
+  const existing = getStudentByMatriculaOrIdFromDb(clean);
+  const idToDelete = existing?.id || clean;
+  const matToDelete = existing?.matricula || clean;
+
+  db.run('DELETE FROM students WHERE id = ? OR lower(trim(matricula)) = ?', [idToDelete, matToDelete.toLowerCase()]);
+  db.run('DELETE FROM attendance_records WHERE studentId = ? OR lower(trim(matricula)) = ?', [idToDelete, matToDelete.toLowerCase()]);
+  db.run('DELETE FROM pending_cloud_sync WHERE entity_id = ? OR entity_id = ?', [idToDelete, matToDelete]);
+  
   persistDatabase();
 
   if (pgDb) {
     pgDb
       .delete(pgStudents)
-      .where(eq(pgStudents.matricula, clean))
+      .where(or(eq(pgStudents.id, idToDelete), eq(pgStudents.matricula, matToDelete)))
       .catch((err) => console.warn('PostgreSQL deleteStudent notice:', err));
+    pgDb
+      .delete(pgAttendanceRecords)
+      .where(or(eq(pgAttendanceRecords.studentId, idToDelete), eq(pgAttendanceRecords.matricula, matToDelete)))
+      .catch((err) => console.warn('PostgreSQL deleteRecords notice:', err));
   }
 
   return true;
